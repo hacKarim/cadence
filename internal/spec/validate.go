@@ -90,6 +90,8 @@ func (w *Workflow) Validate() error {
 		w.validateStep(s, seen, add)
 	}
 
+	w.validateScopes(add)
+
 	if cyc := findCycle(w.Steps); len(cyc) > 0 {
 		add("", "needs", "dependency cycle: "+strings.Join(cyc, " -> "))
 	}

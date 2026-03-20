@@ -1,0 +1,163 @@
+// Package template renders the small, deliberately restricted template
+// language used inside workflow files. Every value a step can see is placed
+// in the scope explicitly, which is what makes step isolation auditable.
+package template
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+	gotemplate "text/template"
+)
+
+// ItemView is one element of a fan-out step's result list.
+type ItemView struct {
+	Index   int
+	Input   any
+	Result  string
+	Outputs map[string]any
+}
+
+func (i ItemView) asMap() map[string]any {
+	return map[string]any{
+		"index":   i.Index,
+		"input":   i.Input,
+		"result":  i.Result,
+		"outputs": orEmpty(i.Outputs),
+	}
+}
+
+// StepView is everything a downstream step may learn about a completed step.
+type StepView struct {
+	Result  string
+	Outputs map[string]any
+	Items   []ItemView
+	Dir     string
+}
+
+func (s StepView) asMap() map[string]any {
+	items := make([]any, len(s.Items))
+	for i, it := range s.Items {
+		items[i] = it.asMap()
+	}
+	return map[string]any{
+		"result":  s.Result,
+		"outputs": orEmpty(s.Outputs),
+		"items":   items,
+		"dir":     s.Dir,
+	}
+}
+
+func orEmpty(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+// Scope is the complete set of values visible to one template render. Item is
+// the current element of a for_each list, which may be a raw JSON value or an
+// ItemView produced by an upstream fan-out step.
+type Scope struct {
+	Steps map[string]StepView
+	Item  any
+}
+
+func (s Scope) data() map[string]any {
+	steps := make(map[string]any, len(s.Steps))
+	for id, v := range s.Steps {
+		steps[id] = v.asMap()
+	}
+	d := map[string]any{"steps": steps}
+	if s.Item != nil {
+		d["item"] = s.Item
+	}
+	return d
+}
+
+// funcs is the entire helper set. Nothing here can read the filesystem, shell
+// out, or reach a value that is not already in the scope.
+var funcs = gotemplate.FuncMap{
+	"json":    toJSON,
+	"trim":    func(s string) string { return strings.TrimSpace(s) },
+	"lines":   func(s string) []string { return strings.Split(strings.TrimRight(s, "\n"), "\n") },
+	"indent":  indent,
+	"default": func(fallback, v any) any { return orDefault(fallback, v) },
+	"file":    stepFile,
+}
+
+func toJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func indent(n int, s string) string {
+	pad := strings.Repeat(" ", n)
+	out := make([]string, 0)
+	for _, l := range strings.Split(s, "\n") {
+		out = append(out, pad+l)
+	}
+	return strings.Join(out, "\n")
+}
+
+func orDefault(fallback, v any) any {
+	switch x := v.(type) {
+	case nil:
+		return fallback
+	case string:
+		if x == "" {
+			return fallback
+		}
+	}
+	return v
+}
+
+// stepFile resolves a path inside a completed step's output directory. It is a
+// helper rather than a method because Go templates can only call exported
+// methods, and `.steps.screen.File` reads worse than `file .steps.screen`.
+func stepFile(step any, name string) (string, error) {
+	m, ok := step.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("file: want a step, got %T", step)
+	}
+	dir, _ := m["dir"].(string)
+	if dir == "" {
+		return "", fmt.Errorf("file: that step has no output directory yet")
+	}
+	if strings.Contains(name, "..") || filepath.IsAbs(name) {
+		return "", fmt.Errorf("file: %q must be a relative path inside the step directory", name)
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// Render executes tmpl against sc. A reference to something not in the scope
+// is an error, never an empty string.
+func Render(tmpl string, sc Scope) (string, error) {
+	t, err := gotemplate.New("cadence").Funcs(funcs).Option("missingkey=error").Parse(tmpl)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, sc.data()); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// RenderJSON renders tmpl and decodes the result as JSON.
+func RenderJSON(tmpl string, sc Scope) (any, error) {
+	s, err := Render(tmpl, sc)
+	if err != nil {
+		return nil, err
+	}
+	var v any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &v); err != nil {
+		return nil, fmt.Errorf("expected JSON, got %.80q: %w", s, err)
+	}
+	return v, nil
+}
