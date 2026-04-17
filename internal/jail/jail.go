@@ -1,0 +1,170 @@
+// Package jail builds the isolated directory tree a single step item runs in.
+// Nothing reaches a step except what its spec declared, which is what makes
+// cadence's isolation guarantee a property of the filesystem rather than a
+// convention.
+package jail
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/hacKarim/cadence/internal/spec"
+	"github.com/hacKarim/cadence/internal/template"
+)
+
+// Jail is one step item's private directory tree.
+type Jail struct {
+	Root string // the item directory
+	Work string // the process cwd, holding staged inputs
+	Out  string // where the step is expected to write results
+	Meta string // engine-owned logs and metadata, never visible to the process
+}
+
+// inputNameRe is the permitted shape of a staged input path: a relative path
+// of plain segments, with no traversal.
+var inputNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
+
+// envAllowlist is everything a step inherits from the parent process.
+// Anything else must be declared on the step.
+var envAllowlist = []string{"PATH", "HOME", "TERM", "LANG", "LC_ALL", "TZ", "SHELL", "TMPDIR"}
+
+// envPrefixAllowlist covers the variables the claude CLI needs to authenticate.
+var envPrefixAllowlist = []string{"ANTHROPIC_", "CLAUDE_"}
+
+// Create builds the tree for one item of one step under a run directory.
+func Create(runDir, stepID string, itemIndex int) (*Jail, error) {
+	root := filepath.Join(runDir, stepID, strconv.Itoa(itemIndex))
+	j := &Jail{
+		Root: root,
+		Work: filepath.Join(root, "work"),
+		Out:  filepath.Join(root, "out"),
+		Meta: filepath.Join(root, "meta"),
+	}
+	for _, d := range []string{j.Work, j.Out, j.Meta} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return nil, fmt.Errorf("create jail: %w", err)
+		}
+	}
+	return j, nil
+}
+
+// Stage materialises the step's workdir and declared inputs inside work/.
+func (j *Jail) Stage(st spec.Step, sc template.Scope) error {
+	if st.Workdir != "" {
+		if err := copyTreeReadOnly(st.Workdir, j.Work); err != nil {
+			return fmt.Errorf("stage workdir %q: %w", st.Workdir, err)
+		}
+	}
+	for name, in := range st.Inputs {
+		if !inputNameRe.MatchString(name) || strings.Contains(name, "..") {
+			return fmt.Errorf("input %q: must be a relative path of plain segments inside the jail", name)
+		}
+		dst := filepath.Join(j.Work, name)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+			return err
+		}
+		switch {
+		case in.Copy != "":
+			src, err := template.Render(in.Copy, sc)
+			if err != nil {
+				return fmt.Errorf("input %q: %w", name, err)
+			}
+			if err := copyFile(strings.TrimSpace(src), dst, 0o600); err != nil {
+				return fmt.Errorf("input %q: %w", name, err)
+			}
+		default:
+			content, err := template.Render(in.Content, sc)
+			if err != nil {
+				return fmt.Errorf("input %q: %w", name, err)
+			}
+			if err := os.WriteFile(dst, []byte(content), 0o600); err != nil {
+				return fmt.Errorf("input %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Env builds the child process environment. It is constructed from an
+// allowlist rather than inherited, so a secret in the parent environment does
+// not silently reach every step.
+func (j *Jail) Env(st spec.Step, parent []string) ([]string, error) {
+	keep := map[string]string{}
+	for _, kv := range parent {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if allowedEnvKey(k) {
+			keep[k] = v
+		}
+	}
+	for k, v := range st.Env {
+		keep[k] = v
+	}
+	out := make([]string, 0, len(keep))
+	for k, v := range keep {
+		out = append(out, k+"="+v)
+	}
+	return out, nil
+}
+
+func allowedEnvKey(k string) bool {
+	for _, a := range envAllowlist {
+		if k == a {
+			return true
+		}
+	}
+	for _, p := range envPrefixAllowlist {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Cleanup removes the jail. The engine keeps jails of finished runs, so this
+// is only used when a run is abandoned before it recorded anything.
+func (j *Jail) Cleanup() error { return os.RemoveAll(j.Root) }
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// copyTreeReadOnly copies a project directory into the jail with the files
+// made unwritable, so a step that was given code to run cannot quietly edit it.
+func copyTreeReadOnly(src, dst string) error {
+	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o750)
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		return copyFile(p, target, 0o444)
+	})
+}
