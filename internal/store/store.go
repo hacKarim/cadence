@@ -7,13 +7,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 // Store is an open cadence database.
-type Store struct{ db *sql.DB }
+type Store struct {
+	db        *sql.DB
+	cacheRoot string
+}
 
 // Run is one execution of a workflow.
 type Run struct {
@@ -75,7 +79,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, cacheRoot: filepath.Join(filepath.Dir(path), "cache")}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
