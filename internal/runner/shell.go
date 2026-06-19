@@ -16,7 +16,7 @@ func (s shellRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := withTimeout(ctx, r.Timeout)
 	defer cancel()
 
-	cmd, err := s.sb.Wrap(ctx, r.Jail, []string{"/bin/sh", "-c", r.Command()})
+	cmd, err := s.sb.Wrap(ctx, r.Jail, []string{"/bin/sh", "-c", r.command()})
 	if err != nil {
 		return nil, err
 	}
@@ -24,11 +24,11 @@ func (s shellRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	return capture(ctx, cmd, r.Jail, r.Timeout, "")
 }
 
-// Command is the shell command to run. The engine has already rendered any
-// template in it.
-func (r Request) Command() string {
-	if r.Prompt != "" {
-		return r.Prompt
+// command is the shell command to run. The engine renders any template in it
+// before the request is built; the raw step text is only a fallback for tests.
+func (r Request) command() string {
+	if r.Script != "" {
+		return r.Script
 	}
 	return r.Step.Run
 }

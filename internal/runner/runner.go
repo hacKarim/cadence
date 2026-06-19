@@ -23,8 +23,11 @@ const MaxCaptureBytes = 1 << 20
 
 // Request is everything needed to run one step item.
 type Request struct {
-	Step    spec.Step
-	Jail    *jail.Jail
+	Step spec.Step
+	Jail *jail.Jail
+	// Script is the rendered shell command for a run step.
+	Script string
+	// Prompt is the rendered prompt for an agent step.
 	Prompt  string
 	Env     []string
 	Timeout time.Duration
