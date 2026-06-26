@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	gotemplate "text/template"
+	"text/template/parse"
 )
 
 // ItemView is one element of a fan-out step's result list.
@@ -149,9 +150,20 @@ func Render(tmpl string, sc Scope) (string, error) {
 	return buf.String(), nil
 }
 
-// RenderJSON renders tmpl and decodes the result as JSON.
+// RenderJSON evaluates tmpl as a value rather than as text.
+//
+// A template like `{{ .steps.screen.outputs.candidates }}` is meant to yield
+// the list itself, but text/template would print it with Go's default
+// formatting, which is not JSON. So a template that is exactly one action is
+// evaluated with json applied to its pipeline. Anything else is rendered
+// normally and parsed, which is how a literal JSON document in a workflow
+// file still works.
 func RenderJSON(tmpl string, sc Scope) (any, error) {
-	s, err := Render(tmpl, sc)
+	effective := tmpl
+	if wrapped, ok := wrapSingleAction(tmpl); ok {
+		effective = wrapped
+	}
+	s, err := Render(effective, sc)
 	if err != nil {
 		return nil, err
 	}
@@ -160,4 +172,29 @@ func RenderJSON(tmpl string, sc Scope) (any, error) {
 		return nil, fmt.Errorf("expected JSON, got %.80q: %w", s, err)
 	}
 	return v, nil
+}
+
+// wrapSingleAction rewrites `{{ pipeline }}` as `{{ pipeline | json }}`. It
+// declines when the template is not a lone action, or when the pipeline
+// already ends in json, which would double-encode the value.
+func wrapSingleAction(tmpl string) (string, bool) {
+	trees, err := parse.Parse("wrap", tmpl, "{{", "}}", parseFuncs)
+	if err != nil {
+		return "", false
+	}
+	t, ok := trees["wrap"]
+	if !ok || t.Root == nil || len(t.Root.Nodes) != 1 {
+		return "", false
+	}
+	action, ok := t.Root.Nodes[0].(*parse.ActionNode)
+	if !ok || action.Pipe == nil || len(action.Pipe.Cmds) == 0 {
+		return "", false
+	}
+	last := action.Pipe.Cmds[len(action.Pipe.Cmds)-1]
+	if len(last.Args) > 0 {
+		if id, ok := last.Args[0].(*parse.IdentifierNode); ok && id.Ident == "json" {
+			return "", false
+		}
+	}
+	return "{{ " + action.Pipe.String() + " | json }}", true
 }

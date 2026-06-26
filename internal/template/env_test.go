@@ -124,3 +124,37 @@ func TestRenderJSONRejectsNonJSON(t *testing.T) {
 		t.Errorf("error %q should mention JSON", err)
 	}
 }
+
+func TestRenderJSONEvaluatesBareActionAsValue(t *testing.T) {
+	v, err := RenderJSON("{{ .steps.screen.outputs.candidates }}", scopeFixture())
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("got %T (%v), want []any: a bare action must evaluate to the value, not its Go formatting", v, v)
+	}
+	if len(arr) != 1 {
+		t.Errorf("len = %d, want 1", len(arr))
+	}
+}
+
+func TestRenderJSONDoesNotDoubleEncode(t *testing.T) {
+	v, err := RenderJSON("{{ .steps.screen.outputs.candidates | json }}", scopeFixture())
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	if _, ok := v.([]any); !ok {
+		t.Fatalf("got %T, want []any: an explicit json pipe must not be wrapped again", v)
+	}
+}
+
+func TestRenderJSONAcceptsLiteralDocument(t *testing.T) {
+	v, err := RenderJSON(`[{"ticker":"AAPL"}]`, scopeFixture())
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	if arr, ok := v.([]any); !ok || len(arr) != 1 {
+		t.Errorf("got %#v, want a one-element array", v)
+	}
+}

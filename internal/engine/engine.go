@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hacKarim/cadence/internal/extract"
@@ -36,6 +38,7 @@ type Engine struct {
 	runners map[string]runner.Runner
 	sb      sandbox.Sandbox
 	opt     Options
+	sem     chan struct{}
 }
 
 // New builds an engine.
@@ -52,13 +55,44 @@ func New(st *store.Store, runners map[string]runner.Runner, sb sandbox.Sandbox, 
 // Backend reports which sandbox backend this engine will confine steps with.
 func (e *Engine) Backend() sandbox.Backend { return e.sb.Name() }
 
-// runState carries the mutable bookkeeping of one run.
+// runState carries the mutable bookkeeping of one run. Ready steps execute
+// concurrently, so every field here is guarded.
 type runState struct {
+	mu       sync.Mutex
 	run      *store.Run
 	views    map[string]template.StepView
 	done     map[string]bool
 	failed   map[string]bool
 	stepRows map[string]*store.StepRun
+}
+
+// scope snapshots the completed steps a template may read.
+func (rs *runState) scope() template.Scope {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	views := make(map[string]template.StepView, len(rs.views))
+	for k, v := range rs.views {
+		views[k] = v
+	}
+	return template.Scope{Steps: views}
+}
+
+func (rs *runState) setView(id string, v template.StepView) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.views[id] = v
+}
+
+func (rs *runState) stepRow(id string) *store.StepRun {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.stepRows[id]
+}
+
+func (rs *runState) setStepRow(id string, row *store.StepRun) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.stepRows[id] = row
 }
 
 // Run executes the workflow and returns the recorded run.
@@ -94,6 +128,10 @@ func (e *Engine) Run(ctx context.Context, wf *spec.Workflow, wfHash string) (*st
 		stepRows: map[string]*store.StepRun{},
 	}
 
+	// One global semaphore bounds how many step items execute at once, across
+	// every step that happens to be ready together.
+	e.sem = make(chan struct{}, e.opt.MaxParallel)
+
 	g := graph.New(wf.Steps)
 	cancelled := false
 
@@ -106,17 +144,33 @@ func (e *Engine) Run(ctx context.Context, wf *spec.Workflow, wfHash string) (*st
 		if len(ready) == 0 {
 			break
 		}
-		for _, id := range ready {
-			st, _ := wf.Step(id)
-			state, err := e.runStep(ctx, wf, st, rs)
-			if err != nil {
-				return e.finish(run, store.StateFailed, err.Error()), nil
+		type outcome struct {
+			id    string
+			state store.State
+			err   error
+		}
+		results := make([]outcome, len(ready))
+		var wg sync.WaitGroup
+		for i, id := range ready {
+			wg.Add(1)
+			go func(i int, id string) {
+				defer wg.Done()
+				st, _ := wf.Step(id)
+				state, err := e.runStep(ctx, wf, st, rs)
+				results[i] = outcome{id: id, state: state, err: err}
+			}(i, id)
+		}
+		wg.Wait()
+
+		for _, o := range results {
+			if o.err != nil {
+				return e.finish(run, store.StateFailed, o.err.Error()), nil
 			}
-			rs.done[id] = true
-			if !state.OK() {
-				rs.failed[id] = true
+			rs.done[o.id] = true
+			if !o.state.OK() {
+				rs.failed[o.id] = true
 			}
-			if state == store.StateCancelled {
+			if o.state == store.StateCancelled {
 				cancelled = true
 			}
 		}
@@ -175,39 +229,176 @@ func (e *Engine) finish(run *store.Run, state store.State, msg string) *store.Ru
 	return run
 }
 
-// runStep executes one step. Task-level fan-out arrives in a later change; a
-// plain step is simply a fan-out of exactly one item, so the item path below
-// is the only execution path.
+// runStep executes one step: it gates on `if`, expands `for_each`, and runs
+// every item in its own jail under the parallelism bounds.
 func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, rs *runState) (store.State, error) {
-	start := time.Now()
-	row := &store.StepRun{RunID: rs.run.ID, StepID: st.ID, State: store.StateRunning, StartedAt: &start}
-	if err := e.store.CreateStepRun(row); err != nil {
-		return store.StateFailed, err
-	}
-	rs.stepRows[st.ID] = row
+	sc := rs.scope()
 
-	sc := template.Scope{Steps: rs.views}
-	item, err := e.runItem(ctx, st, rs, sc, 0, nil)
+	if st.If != "" {
+		ok, err := evalBool(st.If, sc)
+		if err != nil {
+			row := e.newStepRow(rs, st.ID, store.StateRunning)
+			return e.finishStep(row, store.StateFailed, fmt.Sprintf("if: %v", err)), nil
+		}
+		if !ok {
+			row := e.newStepRow(rs, st.ID, store.StateSkipped)
+			row.Error = "skipped: the step's if condition was false"
+			_ = e.store.UpdateStepRun(row)
+			rs.setView(st.ID, template.StepView{})
+			return store.StateSkipped, nil
+		}
+	}
+
+	row := e.newStepRow(rs, st.ID, store.StateRunning)
+
+	items, err := e.expand(st, sc)
 	if err != nil {
 		return e.finishStep(row, store.StateFailed, err.Error()), nil
 	}
 
-	end := time.Now()
-	row.EndedAt = &end
-	state := item.State
-	if state == store.StateFailed {
-		row.Error = item.Error
-	}
-	row.State = state
-	_ = e.store.UpdateStepRun(row)
+	results := make([]*store.StepItem, len(items))
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	perStep := make(chan struct{}, perStepBound(st, e.opt.MaxParallel))
 
-	rs.views[st.ID] = template.StepView{
-		Result:  item.Result,
-		Outputs: item.Outputs,
-		Items:   []template.ItemView{{Index: 0, Result: item.Result, Outputs: item.Outputs}},
-		Dir:     item.JailDir,
+	for i, input := range items {
+		if stop.Load() || ctx.Err() != nil {
+			results[i] = e.recordSkippedItem(rs, st, i, "not started: an earlier item failed")
+			continue
+		}
+		wg.Add(1)
+		go func(i int, input any) {
+			defer wg.Done()
+
+			itemScope := sc
+			itemScope.Item = input
+			if st.WhenItem != "" {
+				keep, err := evalBool(st.WhenItem, itemScope)
+				if err != nil {
+					results[i] = e.recordFailedItem(rs, st, i, fmt.Sprintf("when_item: %v", err))
+					return
+				}
+				if !keep {
+					results[i] = e.recordSkippedItem(rs, st, i, "skipped: when_item was false")
+					return
+				}
+			}
+
+			perStep <- struct{}{}
+			defer func() { <-perStep }()
+			e.sem <- struct{}{}
+			defer func() { <-e.sem }()
+
+			if stop.Load() {
+				results[i] = e.recordSkippedItem(rs, st, i, "not started: an earlier item failed")
+				return
+			}
+
+			it, err := e.runItem(ctx, st, rs, itemScope, i, input)
+			if err != nil {
+				results[i] = e.recordFailedItem(rs, st, i, err.Error())
+				return
+			}
+			results[i] = it
+			if it.State == store.StateFailed && st.OnItemFailure == spec.ItemFailureFailFast {
+				stop.Store(true)
+			}
+		}(i, input)
 	}
+	wg.Wait()
+
+	state, msg := aggregate(results)
+	e.finishStep(row, state, msg)
+	rs.setView(st.ID, viewFor(results))
 	return state, nil
+}
+
+func perStepBound(st *spec.Step, global int) int {
+	if st.MaxParallel > 0 {
+		return st.MaxParallel
+	}
+	return global
+}
+
+func (e *Engine) newStepRow(rs *runState, stepID string, state store.State) *store.StepRun {
+	start := time.Now()
+	row := &store.StepRun{RunID: rs.run.ID, StepID: stepID, State: state, StartedAt: &start}
+	_ = e.store.CreateStepRun(row)
+	rs.setStepRow(stepID, row)
+	return row
+}
+
+func (e *Engine) recordItem(rs *runState, st *spec.Step, index int, state store.State, msg string) *store.StepItem {
+	now := time.Now()
+	it := &store.StepItem{
+		StepRunID: rs.stepRow(st.ID).ID, Index: index, State: state,
+		Error: msg, StartedAt: &now, EndedAt: &now,
+	}
+	_ = e.store.CreateItem(it)
+	return it
+}
+
+func (e *Engine) recordSkippedItem(rs *runState, st *spec.Step, index int, msg string) *store.StepItem {
+	return e.recordItem(rs, st, index, store.StateSkipped, msg)
+}
+
+func (e *Engine) recordFailedItem(rs *runState, st *spec.Step, index int, msg string) *store.StepItem {
+	return e.recordItem(rs, st, index, store.StateFailed, msg)
+}
+
+// aggregate reduces item states to the step's state. A step is only
+// successful when nothing inside it failed or was cancelled.
+func aggregate(items []*store.StepItem) (store.State, string) {
+	var firstErr string
+	failed, cancelled := 0, 0
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		switch it.State {
+		case store.StateFailed:
+			failed++
+			if firstErr == "" {
+				firstErr = it.Error
+			}
+		case store.StateCancelled:
+			cancelled++
+		}
+	}
+	switch {
+	case cancelled > 0:
+		return store.StateCancelled, "cancelled"
+	case failed > 0:
+		return store.StateFailed, fmt.Sprintf("%d of %d items failed: %s", failed, len(items), firstErr)
+	default:
+		return store.StateSucceeded, ""
+	}
+}
+
+// viewFor builds what downstream steps may read about a finished step. Only
+// items that actually produced a result appear in Items, so a for_each over
+// them does not have to filter out skipped ones.
+func viewFor(items []*store.StepItem) template.StepView {
+	v := template.StepView{}
+	for _, it := range items {
+		if it == nil || !it.State.OK() || it.State == store.StateSkipped {
+			continue
+		}
+		v.Items = append(v.Items, template.ItemView{
+			Index: it.Index, Result: it.Result, Outputs: it.Outputs,
+		})
+	}
+	if len(v.Items) == 1 {
+		v.Result = v.Items[0].Result
+		v.Outputs = v.Items[0].Outputs
+	}
+	for _, it := range items {
+		if it != nil && it.JailDir != "" {
+			v.Dir = it.JailDir
+			break
+		}
+	}
+	return v
 }
 
 func (e *Engine) finishStep(row *store.StepRun, state store.State, msg string) store.State {
@@ -225,7 +416,7 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 	}
 	start := time.Now()
 	item := &store.StepItem{
-		StepRunID: rs.stepRows[st.ID].ID, Index: index, State: store.StateRunning,
+		StepRunID: rs.stepRow(st.ID).ID, Index: index, State: store.StateRunning,
 		JailDir: j.Out, StartedAt: &start,
 	}
 	if err := e.store.CreateItem(item); err != nil {
