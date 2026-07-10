@@ -5,7 +5,10 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,6 +32,7 @@ type Options struct {
 	ResumeFrom  int64
 	RunRoot     string
 	Trigger     string
+	Clock       Clock
 }
 
 // Engine executes workflows. Runners are injected by kind ("shell", "agent")
@@ -49,6 +53,9 @@ func New(st *store.Store, runners map[string]runner.Runner, sb sandbox.Sandbox, 
 	if opt.Trigger == "" {
 		opt.Trigger = "manual"
 	}
+	if opt.Clock == nil {
+		opt.Clock = realClock{}
+	}
 	return &Engine{store: st, runners: runners, sb: sb, opt: opt}
 }
 
@@ -64,6 +71,9 @@ type runState struct {
 	done     map[string]bool
 	failed   map[string]bool
 	stepRows map[string]*store.StepRun
+	// inherited holds the items of steps that already succeeded in the run
+	// being resumed. Those steps are not executed again.
+	inherited map[string][]store.StepItem
 }
 
 // scope snapshots the completed steps a template may read.
@@ -103,6 +113,11 @@ func (e *Engine) Run(ctx context.Context, wf *spec.Workflow, wfHash string) (*st
 		}
 	}
 
+	inherited, err := e.inheritable(wfHash)
+	if err != nil {
+		return nil, err
+	}
+
 	runDir := filepath.Join(e.opt.RunRoot, wf.Name, time.Now().Format("20060102-150405.000"))
 	if err := os.MkdirAll(runDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create run directory: %w", err)
@@ -121,11 +136,12 @@ func (e *Engine) Run(ctx context.Context, wf *spec.Workflow, wfHash string) (*st
 	}
 
 	rs := &runState{
-		run:      run,
-		views:    map[string]template.StepView{},
-		done:     map[string]bool{},
-		failed:   map[string]bool{},
-		stepRows: map[string]*store.StepRun{},
+		run:       run,
+		views:     map[string]template.StepView{},
+		done:      map[string]bool{},
+		failed:    map[string]bool{},
+		stepRows:  map[string]*store.StepRun{},
+		inherited: inherited,
 	}
 
 	// One global semaphore bounds how many step items execute at once, across
@@ -229,9 +245,71 @@ func (e *Engine) finish(run *store.Run, state store.State, msg string) *store.Ru
 	return run
 }
 
+// inheritable loads the steps that already succeeded in the run being
+// resumed. Resuming creates a NEW run that references those results, so the
+// failed run stays on record exactly as it happened.
+func (e *Engine) inheritable(wfHash string) (map[string][]store.StepItem, error) {
+	if e.opt.ResumeFrom == 0 {
+		return nil, nil
+	}
+	prior, err := e.store.GetRun(e.opt.ResumeFrom)
+	if err != nil {
+		return nil, fmt.Errorf("resume: run %d not found", e.opt.ResumeFrom)
+	}
+	if prior.WorkflowHash != wfHash {
+		if !e.opt.Force {
+			return nil, fmt.Errorf(
+				"cannot resume run %d: the workflow file changed since it ran, so reusing its results would mix two definitions; re-run with --force to start over",
+				prior.ID)
+		}
+		return nil, nil
+	}
+	if e.opt.Force {
+		return nil, nil
+	}
+	tree, err := e.store.RunTree(prior.ID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]store.StepItem{}
+	for _, s := range tree.Steps {
+		if s.State == store.StateSucceeded || s.State == store.StateCached {
+			out[s.StepID] = s.Items
+		}
+	}
+	return out, nil
+}
+
+// inheritStep records a step whose results are carried over from the run being
+// resumed, without executing anything.
+func (e *Engine) inheritStep(rs *runState, st *spec.Step, items []store.StepItem) store.State {
+	row := e.newStepRow(rs, st.ID, store.StateCached)
+	row.Error = fmt.Sprintf("inherited from run %d", e.opt.ResumeFrom)
+	_ = e.store.UpdateStepRun(row)
+
+	copies := make([]*store.StepItem, 0, len(items))
+	for _, old := range items {
+		now := time.Now()
+		it := &store.StepItem{
+			StepRunID: row.ID, Index: old.Index, State: store.StateCached,
+			JailDir: old.JailDir, CacheKey: old.CacheKey, Result: old.Result,
+			Excerpt: old.Excerpt, Outputs: old.Outputs,
+			StartedAt: &now, EndedAt: &now,
+		}
+		_ = e.store.CreateItem(it)
+		copies = append(copies, it)
+	}
+	rs.setView(st.ID, viewFor(copies))
+	return store.StateCached
+}
+
 // runStep executes one step: it gates on `if`, expands `for_each`, and runs
 // every item in its own jail under the parallelism bounds.
 func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, rs *runState) (store.State, error) {
+	if items, ok := rs.inherited[st.ID]; ok {
+		return e.inheritStep(rs, st, items), nil
+	}
+
 	sc := rs.scope()
 
 	if st.If != "" {
@@ -408,7 +486,8 @@ func (e *Engine) finishStep(row *store.StepRun, state store.State, msg string) s
 	return state
 }
 
-// runItem executes a single step item inside its own jail.
+// runItem executes a single step item inside its own jail: stage, consult the
+// cache, run with retries, then extract.
 func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc template.Scope, index int, input any) (*store.StepItem, error) {
 	j, err := jail.Create(rs.run.RunDir, st.ID, index)
 	if err != nil {
@@ -440,24 +519,47 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 
 	req := runner.Request{Step: *st, Jail: j, Env: env, Timeout: st.Timeout}
 	kind := "shell"
+	rendered := ""
 	if st.IsAgent() {
 		kind = "agent"
 		if req.Prompt, err = template.Render(st.Agent.Prompt, sc); err != nil {
 			return fail(fmt.Sprintf("render prompt: %v", err))
 		}
+		rendered = req.Prompt
 	} else {
 		if req.Script, err = template.Render(st.Run, sc); err != nil {
 			return fail(fmt.Sprintf("render command: %v", err))
 		}
+		rendered = req.Script
 	}
 
 	rn, ok := e.runners[kind]
 	if !ok {
 		return nil, fmt.Errorf("no runner registered for %q steps", kind)
 	}
-	res, err := rn.Run(ctx, req)
+
+	digest, err := stagedDigest(j.Work)
 	if err != nil {
-		return fail(err.Error())
+		return fail(fmt.Sprintf("hash staged inputs: %v", err))
+	}
+	item.CacheKey = store.CacheKey(*st, rendered, digest, rs.run.WorkflowHash, st.Cache, e.opt.Clock.Now())
+
+	if item.CacheKey != "" && !e.opt.Force {
+		if entry, hit, err := e.store.LookupCache(item.CacheKey); err == nil && hit {
+			if err := store.RestoreCache(entry, j); err != nil {
+				return fail(fmt.Sprintf("restore cached artifacts: %v", err))
+			}
+			end := time.Now()
+			item.State, item.Result, item.Outputs, item.EndedAt = store.StateCached, entry.Result, entry.Outputs, &end
+			item.Excerpt = excerpt(entry.Result)
+			_ = e.store.UpdateItem(item)
+			return item, nil
+		}
+	}
+
+	res, runErr := e.attempt(ctx, rn, req, st, item)
+	if runErr != nil {
+		return fail(runErr.Error())
 	}
 
 	end := time.Now()
@@ -487,6 +589,8 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 	if st.Agent != nil {
 		ex = st.Agent.Extract
 	}
+	// Extraction runs once, outside the retry loop: the same output would
+	// fail to parse every time, so retrying only spends another model call.
 	primary, err := extract.Primary(res.Stdout, ex)
 	if err != nil {
 		return fail(err.Error())
@@ -505,7 +609,79 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 	item.Outputs = outs
 	item.State = store.StateSucceeded
 	_ = e.store.UpdateItem(item)
+
+	if item.CacheKey != "" {
+		_ = e.store.SaveCache(item.CacheKey, st.ID, j, outs, primary)
+	}
 	return item, nil
+}
+
+// attempt runs the request, retrying execution failures with backoff. Retries
+// are per item: a step fanning out over forty candidates gives each of them
+// its own budget.
+func (e *Engine) attempt(ctx context.Context, rn runner.Runner, req runner.Request, st *spec.Step, item *store.StepItem) (*runner.Result, error) {
+	attempts := st.Retries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var base, max time.Duration
+	var factor float64
+	if st.Backoff != nil {
+		base, factor, max = st.Backoff.Base, st.Backoff.Factor, st.Backoff.Max
+	}
+
+	var res *runner.Result
+	var lastErr error
+	for n := 0; n < attempts; n++ {
+		item.Attempt = n
+		res, lastErr = rn.Run(ctx, req)
+		if lastErr == nil && res != nil && res.ExitCode == 0 && !res.TimedOut {
+			return res, nil
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if n < attempts-1 {
+			e.opt.Clock.Sleep(backoffFor(base, factor, max, n))
+		}
+	}
+	if res == nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("runner returned no result")
+		}
+		return nil, lastErr
+	}
+	return res, nil
+}
+
+// stagedDigest hashes the staged input tree so the cache key changes whenever
+// what the step was given changes.
+func stagedDigest(dir string) (string, error) {
+	h := sha256.New()
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "%s\x00", rel)
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(h, f)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 const excerptBytes = 4096

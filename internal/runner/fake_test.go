@@ -57,3 +57,22 @@ func TestFakeTracksPeakConcurrency(t *testing.T) {
 		t.Errorf("Peak = %d, want at least 2 with five concurrent calls", f.Peak())
 	}
 }
+
+// The real runners apply Request.Timeout themselves, so the fake must model
+// the same contract or engine timeout behaviour goes untested.
+func TestFakeHonoursRequestTimeout(t *testing.T) {
+	f := NewFake(map[string]FakeResponse{"a": {Delay: 2 * time.Second}})
+	r := req("a")
+	r.Timeout = 50 * time.Millisecond
+	start := time.Now()
+	res, err := f.Run(context.Background(), r)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.TimedOut {
+		t.Error("TimedOut = false, want true")
+	}
+	if time.Since(start) > time.Second {
+		t.Error("Run waited for the full delay instead of timing out")
+	}
+}

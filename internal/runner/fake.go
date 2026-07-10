@@ -38,6 +38,14 @@ func NewFake(script map[string]FakeResponse) *Fake {
 
 // Run records the call and returns the scripted result.
 func (f *Fake) Run(ctx context.Context, r Request) (*Result, error) {
+	// The real runners apply the request timeout themselves, so the fake does
+	// too; otherwise engine timeout handling would never be exercised.
+	if r.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		defer cancel()
+	}
+
 	f.mu.Lock()
 	f.calls = append(f.calls, r)
 	n := f.counts[r.Step.ID]
