@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestSeatbeltProfileDeniesOutsideWrites(t *testing.T) {
 		t.Error("profile does not deny by default")
 	}
 	for _, dir := range []string{j.Work, j.Out} {
-		if !strings.Contains(p, `(subpath "`+dir+`")`) {
+		if !strings.Contains(p, `(subpath "`+resolve(dir)+`")`) {
 			t.Errorf("profile does not allow %q", dir)
 		}
 	}
@@ -78,6 +79,32 @@ func TestSeatbeltProfileDeniesOutsideWrites(t *testing.T) {
 	}
 	if strings.Contains(p, `(subpath "`+j.Meta+`")`) {
 		t.Error("profile exposes the engine-owned meta directory to the step")
+	}
+}
+
+// Without the system base profile, dyld cannot start a process at all and
+// every sandboxed step aborts before running.
+func TestSeatbeltProfileImportsSystemBase(t *testing.T) {
+	if p := seatbeltProfile(newJail(t)); !strings.Contains(p, `(import "bsd.sb")`) {
+		t.Error("profile does not import the system base profile")
+	}
+}
+
+// On macOS the temporary and home directories are reached through symlinks.
+// A profile written in terms of the unresolved path matches nothing, so the
+// step cannot even write inside its own jail.
+func TestSeatbeltProfileUsesResolvedPaths(t *testing.T) {
+	j := newJail(t)
+	real, err := filepath.EvalSymlinks(j.Work)
+	if err != nil {
+		t.Skip("cannot resolve the temp dir on this platform")
+	}
+	if real == j.Work {
+		t.Skip("temp dir is not reached through a symlink here")
+	}
+	p := seatbeltProfile(j)
+	if !strings.Contains(p, `(subpath "`+real+`")`) {
+		t.Errorf("profile uses the unresolved path; it must use %q", real)
 	}
 }
 
