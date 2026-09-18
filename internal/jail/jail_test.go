@@ -129,13 +129,24 @@ func TestEnvIncludesDeclaredStepEnv(t *testing.T) {
 	}
 }
 
-func TestEnvContainsNoRunRootPath(t *testing.T) {
+// A step may be told where its own output goes, but never handed a path it
+// could walk up from to reach the run root or a sibling step's jail.
+func TestEnvExposesNothingOutsideThisJail(t *testing.T) {
 	runDir := t.TempDir()
 	j, _ := Create(runDir, "a", 0)
+	_, _ = Create(runDir, "neighbour", 0)
 	env, _ := j.Env(spec.Step{ID: "a"}, []string{"PATH=/bin", "HOME=/home/x"})
+
 	for _, kv := range env {
-		if strings.Contains(kv, runDir) {
-			t.Errorf("environment exposes the run root: %q", kv)
+		_, v, _ := strings.Cut(kv, "=")
+		if !strings.Contains(v, runDir) {
+			continue
+		}
+		if v == runDir || v == j.Root || v == filepath.Join(runDir, "neighbour") {
+			t.Errorf("environment hands the step a path outside its jail: %q", kv)
+		}
+		if rel, err := filepath.Rel(j.Work, v); err != nil || strings.HasPrefix(rel, "..") {
+			t.Errorf("environment exposes %q, which is outside the step's working directory", kv)
 		}
 	}
 }
@@ -174,4 +185,42 @@ func TestIsolationNeighbourNotVisible(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sceptic.Work, "stdout.log")); err == nil {
 		t.Error("analyst reasoning trace is reachable from the sceptic jail")
 	}
+}
+
+// A step's cwd is work/, so the directory it is meant to write results into
+// has to be addressable from there. Otherwise `out/report.md` in a workflow
+// silently resolves to nothing.
+func TestOutIsReachableFromWork(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	rel, err := filepath.Rel(j.Work, j.Out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel != "out" {
+		t.Errorf("out is at %q relative to the working directory, want %q", rel, "out")
+	}
+}
+
+// meta/ holds the engine's own logs and must stay outside the step's reach.
+func TestMetaIsNotReachableFromWork(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	rel, err := filepath.Rel(j.Work, j.Meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(rel, "..") {
+		t.Errorf("meta is at %q relative to the working directory; it must not be inside it", rel)
+	}
+}
+
+func TestEnvExposesOutputDirectory(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	env, _ := j.Env(spec.Step{ID: "a"}, []string{"PATH=/bin"})
+	want := "CADENCE_OUT=" + j.Out
+	for _, kv := range env {
+		if kv == want {
+			return
+		}
+	}
+	t.Errorf("environment does not expose the output directory: %v", env)
 }

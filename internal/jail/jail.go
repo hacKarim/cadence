@@ -18,11 +18,19 @@ import (
 )
 
 // Jail is one step item's private directory tree.
+//
+// Out sits inside Work so a step can simply write to `out/report.md` from its
+// working directory. Meta sits outside it: it holds the engine's own logs and
+// is never reachable from the step.
+//
+//	<root>/work/      the process cwd, holding staged inputs
+//	<root>/work/out/  where the step writes results
+//	<root>/meta/      engine-owned logs, outside the step's reach
 type Jail struct {
-	Root string // the item directory
-	Work string // the process cwd, holding staged inputs
-	Out  string // where the step is expected to write results
-	Meta string // engine-owned logs and metadata, never visible to the process
+	Root string
+	Work string
+	Out  string
+	Meta string
 }
 
 // inputNameRe is the permitted shape of a staged input path: a relative path
@@ -39,10 +47,11 @@ var envPrefixAllowlist = []string{"ANTHROPIC_", "CLAUDE_"}
 // Create builds the tree for one item of one step under a run directory.
 func Create(runDir, stepID string, itemIndex int) (*Jail, error) {
 	root := filepath.Join(runDir, stepID, strconv.Itoa(itemIndex))
+	work := filepath.Join(root, "work")
 	j := &Jail{
 		Root: root,
-		Work: filepath.Join(root, "work"),
-		Out:  filepath.Join(root, "out"),
+		Work: work,
+		Out:  filepath.Join(work, "out"),
 		Meta: filepath.Join(root, "meta"),
 	}
 	for _, d := range []string{j.Work, j.Out, j.Meta} {
@@ -107,6 +116,9 @@ func (j *Jail) Env(st spec.Step, parent []string) ([]string, error) {
 	for k, v := range st.Env {
 		keep[k] = v
 	}
+	// The step is told where to put results, so a workflow can use an absolute
+	// path as well as the relative out/ beside its working directory.
+	keep["CADENCE_OUT"] = j.Out
 	out := make([]string, 0, len(keep))
 	for k, v := range keep {
 		out = append(out, k+"="+v)
