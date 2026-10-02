@@ -41,7 +41,9 @@ func resolve(p string) string {
 // seatbeltProfile builds the sandbox profile for one jail. The item root and
 // its meta directory are deliberately absent: meta holds the engine's own logs
 // of this and sibling steps, and a step has no business reading them.
-func seatbeltProfile(j *jailRef) string {
+func seatbeltProfile(j *jailRef) string { return seatbeltProfileWithPolicy(j, Policy{}) }
+
+func seatbeltProfileWithPolicy(j *jailRef, pol Policy) string {
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
 	// The system base profile supplies what every process needs to start.
@@ -58,7 +60,7 @@ func seatbeltProfile(j *jailRef) string {
 	for _, p := range readOnlySystemPaths {
 		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", p)
 	}
-	for _, p := range []string{j.Work, j.Out} {
+	for _, p := range append([]string{j.Work, j.Out}, pol.ReadWrite...) {
 		real := resolve(p)
 		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", real)
 		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", real)
@@ -67,8 +69,8 @@ func seatbeltProfile(j *jailRef) string {
 }
 
 // Wrap runs argv under sandbox-exec with a generated profile.
-func (Seatbelt) Wrap(ctx context.Context, j *jailRef, argv []string) (*exec.Cmd, error) {
-	args := append([]string{"-p", seatbeltProfile(j), "--"}, argv...)
+func (Seatbelt) Wrap(ctx context.Context, j *jailRef, argv []string, pol Policy) (*exec.Cmd, error) {
+	args := append([]string{"-p", seatbeltProfileWithPolicy(j, pol), "--"}, argv...)
 	cmd := exec.CommandContext(ctx, "sandbox-exec", args...)
 	cmd.Dir = j.Work
 	return cmd, nil

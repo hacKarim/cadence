@@ -18,7 +18,9 @@ func (Bubblewrap) Enforced() bool { return true }
 
 // bwrapArgs builds the argument list. The item root and its meta directory are
 // never bound, so a step cannot reach the engine's logs or a sibling's output.
-func bwrapArgs(j *jailRef, argv []string) []string {
+func bwrapArgs(j *jailRef, argv []string) []string { return bwrapArgsWithPolicy(j, argv, Policy{}) }
+
+func bwrapArgsWithPolicy(j *jailRef, argv []string, pol Policy) []string {
 	args := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
 		"--share-net",
@@ -32,18 +34,19 @@ func bwrapArgs(j *jailRef, argv []string) []string {
 			args = append(args, "--ro-bind", p, p)
 		}
 	}
-	args = append(args,
-		"--bind", j.Work, j.Work,
-		"--bind", j.Out, j.Out,
-		"--chdir", j.Work,
-		"--",
-	)
+	args = append(args, "--bind", j.Work, j.Work, "--bind", j.Out, j.Out)
+	for _, p := range pol.ReadWrite {
+		if _, err := os.Stat(p); err == nil {
+			args = append(args, "--bind", p, p)
+		}
+	}
+	args = append(args, "--chdir", j.Work, "--")
 	return append(args, argv...)
 }
 
 // Wrap runs argv under bwrap.
-func (Bubblewrap) Wrap(ctx context.Context, j *jailRef, argv []string) (*exec.Cmd, error) {
-	cmd := exec.CommandContext(ctx, "bwrap", bwrapArgs(j, argv)...)
+func (Bubblewrap) Wrap(ctx context.Context, j *jailRef, argv []string, pol Policy) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "bwrap", bwrapArgsWithPolicy(j, argv, pol)...)
 	cmd.Dir = j.Work
 	return cmd, nil
 }

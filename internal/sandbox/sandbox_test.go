@@ -53,7 +53,7 @@ func TestRequireAcceptsEnforced(t *testing.T) {
 func TestWrapSetsCwdToWork(t *testing.T) {
 	j := newJail(t)
 	for _, sb := range []Sandbox{Confined{}, Seatbelt{}, Bubblewrap{}} {
-		cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/echo", "hi"})
+		cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/echo", "hi"}, Policy{})
 		if err != nil {
 			t.Fatalf("%s Wrap: %v", sb.Name(), err)
 		}
@@ -110,7 +110,7 @@ func TestSeatbeltProfileUsesResolvedPaths(t *testing.T) {
 
 func TestSeatbeltWrapInvokesSandboxExec(t *testing.T) {
 	j := newJail(t)
-	cmd, err := Seatbelt{}.Wrap(context.Background(), j, []string{"/bin/echo", "hi"})
+	cmd, err := Seatbelt{}.Wrap(context.Background(), j, []string{"/bin/echo", "hi"}, Policy{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,5 +137,58 @@ func TestBubblewrapBindsWorkAndOutOnly(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--chdir "+j.Work) {
 		t.Error("chdir not set to work")
+	}
+}
+
+// Some programs cannot run at all without their own configuration and
+// temporary directories. The claude CLI is one: it opens a per-user temp
+// directory before it does anything. A policy grants those paths explicitly,
+// so what a step can reach stays declared rather than accidental.
+func TestSeatbeltProfileAllowsPolicyPaths(t *testing.T) {
+	j := newJail(t)
+	p := seatbeltProfileWithPolicy(j, Policy{ReadWrite: []string{"/tmp/claude-501"}})
+	if !strings.Contains(p, `(subpath "`+resolve("/tmp/claude-501")+`")`) {
+		t.Errorf("profile does not grant the policy path:\n%s", p)
+	}
+}
+
+func TestEmptyPolicyGrantsNothingExtra(t *testing.T) {
+	j := newJail(t)
+	withPolicy := seatbeltProfileWithPolicy(j, Policy{})
+	plain := seatbeltProfile(j)
+	if withPolicy != plain {
+		t.Error("an empty policy changed the profile")
+	}
+}
+
+func TestBubblewrapBindsPolicyPaths(t *testing.T) {
+	j := newJail(t)
+	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{"/tmp"}})
+	if !strings.Contains(strings.Join(args, " "), "--bind /tmp /tmp") {
+		t.Errorf("policy path not bound: %v", args)
+	}
+}
+
+// Some setups cannot run an agent under an enforcing sandbox: on macOS the
+// CLI's keychain credentials are unreachable from inside the jail. The escape
+// hatch is explicit and visible rather than a silent downgrade.
+func TestDetectHonoursExplicitOverride(t *testing.T) {
+	t.Setenv("CADENCE_SANDBOX", "confined")
+	if got := Detect().Name(); got != BackendConfined {
+		t.Errorf("Detect = %q, want the override to be honoured", got)
+	}
+}
+
+func TestDetectIgnoresUnknownOverride(t *testing.T) {
+	t.Setenv("CADENCE_SANDBOX", "nonsense")
+	if got := Detect().Name(); got == "" {
+		t.Error("Detect returned no backend for an unknown override")
+	}
+}
+
+func TestOverriddenReportsWhetherTheUserForcedIt(t *testing.T) {
+	t.Setenv("CADENCE_SANDBOX", "confined")
+	if !Overridden() {
+		t.Error("Overridden = false although CADENCE_SANDBOX is set")
 	}
 }

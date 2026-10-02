@@ -16,7 +16,7 @@ func (s shellRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := withTimeout(ctx, r.Timeout)
 	defer cancel()
 
-	cmd, err := s.sb.Wrap(ctx, r.Jail, []string{"/bin/sh", "-c", r.command()})
+	cmd, err := s.sb.Wrap(ctx, r.Jail, []string{"/bin/sh", "-c", r.command()}, policyFor(r.Step, false))
 	if err != nil {
 		return nil, err
 	}

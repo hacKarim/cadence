@@ -18,7 +18,7 @@ func (Confined) Name() Backend { return BackendConfined }
 func (Confined) Enforced() bool { return false }
 
 // Wrap runs the command directly, with the jail as its working directory.
-func (Confined) Wrap(ctx context.Context, j *jailRef, argv []string) (*exec.Cmd, error) {
+func (Confined) Wrap(ctx context.Context, j *jailRef, argv []string, _ Policy) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = j.Work
 	return cmd, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -116,5 +117,97 @@ func TestAgentRawEnvelopeIsLogged(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(r.Jail.Meta, "stdout.log"))
 	if err != nil || !strings.Contains(string(b), "total_cost_usd") {
 		t.Errorf("raw envelope not logged: %v %q", err, b)
+	}
+}
+
+// The agent process needs its own config and temp directories or it exits
+// before producing anything. Those paths are declared, not inherited.
+func TestAgentDeclaresItsSupportPaths(t *testing.T) {
+	p := AgentSupportPaths()
+	if len(p) == 0 {
+		t.Fatal("agent runner declares no support paths")
+	}
+	var hasConfig, hasTemp bool
+	for _, path := range p {
+		if strings.Contains(path, ".claude") {
+			hasConfig = true
+		}
+		if strings.Contains(path, "tmp") || strings.Contains(path, "Temp") || strings.Contains(path, "folders") {
+			hasTemp = true
+		}
+	}
+	if !hasConfig {
+		t.Errorf("support paths do not include the claude configuration directory: %v", p)
+	}
+	if !hasTemp {
+		t.Errorf("support paths do not include a temporary directory: %v", p)
+	}
+}
+
+func TestStepAllowListReachesThePolicy(t *testing.T) {
+	st := spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}, Allow: []string{"/opt/data"}}
+	got := policyFor(st, true)
+	var found bool
+	for _, p := range got.ReadWrite {
+		if p == "/opt/data" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("declared allow path missing from the sandbox policy: %v", got.ReadWrite)
+	}
+}
+
+func TestShellPolicyOmitsAgentSupportPaths(t *testing.T) {
+	st := spec.Step{ID: "a", Run: "echo"}
+	got := policyFor(st, false)
+	for _, p := range got.ReadWrite {
+		if strings.Contains(p, ".claude") {
+			t.Errorf("a shell step was granted the agent's configuration: %v", got.ReadWrite)
+		}
+	}
+}
+
+func TestPolicyExpandsHomePrefix(t *testing.T) {
+	st := spec.Step{ID: "a", Run: "echo", Allow: []string{"~/.config/tool"}}
+	for _, p := range policyFor(st, false).ReadWrite {
+		if strings.HasPrefix(p, "~") {
+			t.Errorf("home prefix was not expanded: %q", p)
+		}
+	}
+}
+
+// On macOS the CLI's credentials live in the keychain, not in a dotfile. A
+// step denied that store is told to log in again on every run.
+func TestAgentSupportPathsIncludeCredentialStore(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("credential store path is macOS specific")
+	}
+	var found bool
+	for _, p := range AgentSupportPaths() {
+		if strings.Contains(p, "Keychains") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("support paths omit the keychain: %v", AgentSupportPaths())
+	}
+}
+
+// When the CLI reports an error in its envelope, that message is the only
+// explanation there is: stderr is empty. Losing it leaves a user staring at
+// "exit status 1" with nothing to act on.
+func TestAgentSurfacesEnvelopeErrorMessage(t *testing.T) {
+	bin, _ := filepath.Abs("testdata/fake-claude-error.sh")
+	r, _ := agentReq(t, spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}}, "x")
+	res, err := NewAgent(sandbox.Confined{}, bin).Run(context.Background(), r)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Error("ExitCode = 0, want failure")
+	}
+	if !strings.Contains(res.Stderr, "Not logged in") {
+		t.Errorf("Stderr = %q, want the envelope's error message", res.Stderr)
 	}
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"os/exec"
@@ -18,6 +17,9 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 
 	sb := sandbox.Detect()
 	fmt.Fprintf(stdout, "sandbox backend: %s\n", sb.Name())
+	if sandbox.Overridden() {
+		fmt.Fprintln(stdout, "                 (forced through CADENCE_SANDBOX)")
+	}
 	if sb.Enforced() {
 		fmt.Fprintln(stdout, "                 isolation is enforced by the kernel")
 	} else {
@@ -53,5 +55,3 @@ func cmdVersion(stdout io.Writer) int {
 	fmt.Fprintln(stdout, version.String())
 	return 0
 }
-
-var _ = flag.ContinueOnError

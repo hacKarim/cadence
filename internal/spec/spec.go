@@ -121,18 +121,22 @@ type InputSpec struct {
 
 // Step is a single node of a workflow. Exactly one of Run and Agent is set.
 type Step struct {
-	ID            string
-	Needs         []string
-	Run           string
-	Agent         *AgentSpec
-	ForEach       string
-	WhenItem      string
-	If            string
-	MaxParallel   int
-	Cache         CacheMode
-	Isolate       bool
-	Workdir       string
-	Env           map[string]string
+	ID          string
+	Needs       []string
+	Run         string
+	Agent       *AgentSpec
+	ForEach     string
+	WhenItem    string
+	If          string
+	MaxParallel int
+	Cache       CacheMode
+	Isolate     bool
+	Workdir     string
+	Env         map[string]string
+	// Allow lists paths outside the jail this step may read and write. It is
+	// how a workflow grants a step access to something the machine provides,
+	// such as a tool's configuration directory, without widening every step.
+	Allow         []string
 	Inputs        map[string]InputSpec
 	Outputs       map[string]OutputSpec
 	Timeout       time.Duration

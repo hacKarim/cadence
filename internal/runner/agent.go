@@ -4,10 +4,66 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+
+	"github.com/hacKarim/cadence/internal/spec"
 
 	"github.com/hacKarim/cadence/internal/sandbox"
 )
+
+// AgentSupportPaths are the directories the claude CLI needs for itself: its
+// configuration and session state, and the per-user temporary directory it
+// opens before doing anything. A step confined without them exits immediately.
+//
+// Granting them is a deliberate, documented widening: an agent step with file
+// tools can reach its own CLI state. It still cannot reach another step's
+// jail, which is the isolation this project is built around.
+func AgentSupportPaths() []string {
+	var out []string
+	if home, err := os.UserHomeDir(); err == nil {
+		out = append(out, filepath.Join(home, ".claude"), filepath.Join(home, ".claude.json"))
+		if runtime.GOOS == "darwin" {
+			// The CLI stores its credentials in the macOS keychain, so a step
+			// without this is told to log in again on every run.
+			out = append(out,
+				filepath.Join(home, "Library", "Keychains"),
+				filepath.Join(home, "Library", "Preferences"),
+				filepath.Join(home, "Library", "Caches"),
+			)
+		}
+	}
+	out = append(out, os.TempDir())
+	out = append(out, filepath.Join("/tmp", "claude-"+strconv.Itoa(os.Getuid())))
+	return out
+}
+
+// policyFor builds the sandbox policy for a step: the paths its own spec
+// declares, plus the agent CLI's support paths when it is an agent step.
+func policyFor(st spec.Step, isAgent bool) sandbox.Policy {
+	var paths []string
+	if isAgent {
+		paths = append(paths, AgentSupportPaths()...)
+	}
+	for _, a := range st.Allow {
+		paths = append(paths, expandHome(a))
+	}
+	return sandbox.Policy{ReadWrite: paths}
+}
+
+func expandHome(p string) string {
+	if !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, p[2:])
+}
 
 type agentRunner struct {
 	sb  sandbox.Sandbox
@@ -60,7 +116,7 @@ func (a agentRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := withTimeout(ctx, r.Timeout)
 	defer cancel()
 
-	cmd, err := a.sb.Wrap(ctx, r.Jail, a.argv(r))
+	cmd, err := a.sb.Wrap(ctx, r.Jail, a.argv(r), policyFor(r.Step, true))
 	if err != nil {
 		return nil, err
 	}
@@ -82,8 +138,15 @@ func (a agentRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	res.InputTokens = env.Usage.InputTokens
 	res.OutputTokens = env.Usage.OutputTokens
 	res.CostUSD = env.CostUSD
-	if env.IsError && res.ExitCode == 0 {
-		res.ExitCode = 1
+	if env.IsError {
+		if res.ExitCode == 0 {
+			res.ExitCode = 1
+		}
+		// The CLI reports its failures in the envelope and leaves stderr
+		// empty, so without this the user sees only an exit code.
+		if strings.TrimSpace(res.Stderr) == "" {
+			res.Stderr = env.Result
+		}
 	}
 	return res, nil
 }

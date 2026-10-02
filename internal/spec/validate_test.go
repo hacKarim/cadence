@@ -145,3 +145,15 @@ steps:
 		t.Errorf("got %d errors (%v), want at least 3 reported at once", len(errs), errs)
 	}
 }
+
+func TestValidateRejectsRelativeAllowPath(t *testing.T) {
+	wf := mustParse(t, "name: w\nsteps:\n  - id: a\n    run: /bin/true\n    allow: [\"../secrets\"]\n")
+	wantInvalid(t, wf, "allow")
+}
+
+func TestValidateAcceptsAbsoluteAndHomeAllowPaths(t *testing.T) {
+	wf := mustParse(t, "name: w\nsteps:\n  - id: a\n    run: /bin/true\n    allow: [\"/opt/x\", \"~/.config/y\"]\n")
+	if err := wf.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}

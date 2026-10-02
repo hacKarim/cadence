@@ -17,7 +17,7 @@ func TestEnforcedBackendAllowsWriteInsideJail(t *testing.T) {
 		t.Skipf("no enforcing sandbox available (backend %q)", sb.Name())
 	}
 	j := newJail(t)
-	cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/sh", "-c", "echo inside > ok.txt"})
+	cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/sh", "-c", "echo inside > ok.txt"}, Policy{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestEnforcedBackendBlocksReadingNeighbourJail(t *testing.T) {
 	}
 	sceptic, _ := jailCreate(t, runDir, "challenge", 0)
 
-	cmd, err := sb.Wrap(context.Background(), sceptic, []string{"/bin/sh", "-c", "cat " + secret})
+	cmd, err := sb.Wrap(context.Background(), sceptic, []string{"/bin/sh", "-c", "cat " + secret}, Policy{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestEnforcedBackendBlocksWriteOutsideJail(t *testing.T) {
 	}
 	j := newJail(t)
 	escape := filepath.Join(j.Root, "escape")
-	cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/sh", "-c", "echo x > ../escape"})
+	cmd, err := sb.Wrap(context.Background(), j, []string{"/bin/sh", "-c", "echo x > ../../escape"}, Policy{})
 	if err != nil {
 		t.Fatal(err)
 	}

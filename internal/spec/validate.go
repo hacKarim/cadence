@@ -151,6 +151,11 @@ func (w *Workflow) validateStep(s *Step, known map[string]bool, add func(step, f
 			add(s.ID, field, "set either select or regex, not both")
 		}
 	}
+	for _, a := range s.Allow {
+		if !strings.HasPrefix(a, "/") && !strings.HasPrefix(a, "~/") {
+			add(s.ID, "allow", fmt.Sprintf("%q must be an absolute path or start with ~/", a))
+		}
+	}
 	for name, in := range s.Inputs {
 		if in.Content == "" && in.Copy == "" {
 			add(s.ID, "inputs."+name, "set either content or copy")

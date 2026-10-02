@@ -239,6 +239,7 @@ func (s *Step) UnmarshalYAML(n *yaml.Node) error {
 		Isolate       bool                  `yaml:"isolate"`
 		Workdir       string                `yaml:"workdir"`
 		Env           map[string]string     `yaml:"env"`
+		Allow         []string              `yaml:"allow"`
 		Inputs        map[string]InputSpec  `yaml:"inputs"`
 		Outputs       map[string]OutputSpec `yaml:"outputs"`
 		Timeout       string                `yaml:"timeout"`
@@ -256,7 +257,7 @@ func (s *Step) UnmarshalYAML(n *yaml.Node) error {
 	s.ID, s.Needs, s.Run, s.Agent = raw.ID, raw.Needs, raw.Run, raw.Agent
 	s.ForEach, s.WhenItem, s.If = raw.ForEach, raw.WhenItem, raw.If
 	s.MaxParallel, s.Cache, s.Isolate, s.Workdir = raw.MaxParallel, raw.Cache, raw.Isolate, raw.Workdir
-	s.Env, s.Inputs, s.Outputs = raw.Env, raw.Inputs, raw.Outputs
+	s.Env, s.Inputs, s.Outputs, s.Allow = raw.Env, raw.Inputs, raw.Outputs, raw.Allow
 	s.Timeout, s.Retries, s.Backoff, s.OnItemFailure = t, raw.Retries, raw.Backoff, raw.OnItemFailure
 	return nil
 }

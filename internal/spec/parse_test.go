@@ -234,3 +234,21 @@ func TestParseResearchFunnelExample(t *testing.T) {
 		t.Errorf("Notify.On = %v, want [failure]", wf.Notify.On)
 	}
 }
+
+func TestParseStepAllowList(t *testing.T) {
+	wf, err := Parse([]byte(`
+name: w
+steps:
+  - id: a
+    run: /bin/true
+    allow:
+      - ~/.config/tool
+      - /opt/data
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := wf.Steps[0].Allow; len(got) != 2 || got[1] != "/opt/data" {
+		t.Errorf("Allow = %v", got)
+	}
+}
