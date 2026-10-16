@@ -9,7 +9,6 @@ import (
 
 	"github.com/hacKarim/cadence/internal/runner"
 	"github.com/hacKarim/cadence/internal/sandbox"
-	"github.com/hacKarim/cadence/internal/spec"
 	"github.com/hacKarim/cadence/internal/store"
 )
 
@@ -235,5 +234,3 @@ func TestNeverCachedByDefault(t *testing.T) {
 		t.Errorf("made %d calls, want 2: caching is opt-in", f.CallCount("a"))
 	}
 }
-
-var _ = spec.CacheAlways

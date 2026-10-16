@@ -22,6 +22,7 @@ usage:
   cadence validate <workflow.yaml>
   cadence runs [workflow]
   cadence logs <run-id> [step]
+  cadence            launch the interactive interface
   cadence doctor
   cadence cache prune [--older-than 168h]
   cadence version
@@ -30,8 +31,7 @@ usage:
 // run is the whole CLI, with its streams injected so it is testable.
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
-		return 2
+		return cmdTUI(stderr)
 	}
 	switch args[0] {
 	case "run":
