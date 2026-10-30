@@ -75,6 +75,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
+	_ = notifyRun(ctx, st, wf, run, stdout)
 	printRunTree(stdout, st, run.ID)
 	fmt.Fprintf(stdout, "\nrun %d %s\n", run.ID, run.State)
 	if run.Error != "" {

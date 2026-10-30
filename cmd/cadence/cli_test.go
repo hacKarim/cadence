@@ -153,3 +153,37 @@ func TestVersionPrintsBuildInfo(t *testing.T) {
 		t.Errorf("version output %q", out)
 	}
 }
+
+func TestDaemonOnceTicksAndExits(t *testing.T) {
+	dir := t.TempDir()
+	body := "name: nightly\nschedule: \"0 0 7 * * *\"\nsteps:\n  - id: a\n    run: echo a\n"
+	if err := os.WriteFile(filepath.Join(dir, "nightly.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := invoke(t, "daemon", "--dir", dir, "--once")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errs)
+	}
+	if !strings.Contains(out, "nightly") {
+		t.Errorf("daemon output %q should mention the workflow it is watching", out)
+	}
+}
+
+func TestDaemonRejectsMissingDirectory(t *testing.T) {
+	code, _, errs := invoke(t, "daemon", "--dir", "/no/such/dir", "--once")
+	if code == 0 || errs == "" {
+		t.Errorf("exit %d stderr %q, want an error", code, errs)
+	}
+}
+
+func TestRunSendsNoNotificationWithoutANotifyBlock(t *testing.T) {
+	// A workflow with no notify block must not attempt any webhook, which
+	// would otherwise show up as an error on an offline machine.
+	code, _, errs := invoke(t, "run", writeWF(t, goodWF))
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errs)
+	}
+	if strings.Contains(errs, "notify") {
+		t.Errorf("stderr mentions notify for a workflow that configures none: %q", errs)
+	}
+}

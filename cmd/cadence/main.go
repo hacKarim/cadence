@@ -23,6 +23,7 @@ usage:
   cadence runs [workflow]
   cadence logs <run-id> [step]
   cadence            launch the interactive interface
+  cadence daemon [--dir DIR] [--interval 10s]
   cadence doctor
   cadence cache prune [--older-than 168h]
   cadence version
@@ -42,6 +43,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdRuns(args[1:], stdout, stderr)
 	case "logs":
 		return cmdLogs(args[1:], stdout, stderr)
+	case "daemon":
+		return cmdDaemon(args[1:], stdout, stderr)
 	case "doctor":
 		return cmdDoctor(args[1:], stdout, stderr)
 	case "cache":
