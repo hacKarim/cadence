@@ -1,0 +1,61 @@
+# Review each changed file on its own, then synthesise one report.
+#
+# Per-file reviewers are independent on purpose: a reviewer that has seen the
+# whole diff tends to agree with itself across files.
+name: code-review
+description: Review changed files in parallel, then synthesise the findings.
+
+schedule: "0 0 18 * * 1-5"
+timezone: Europe/Paris
+concurrency: skip
+
+defaults:
+  timeout: 10m
+  retries: 1
+
+notify:
+  on: [failure]
+  discord: ${DISCORD_WEBHOOK}
+
+steps:
+  - id: changed
+    workdir: ./repo
+    run: |
+      git diff --name-only origin/main...HEAD > out/names.txt
+      python3 -c "import json,sys; print(json.dumps([{'path': l.strip()} for l in open('out/names.txt') if l.strip()]))" > out/files.json
+    outputs:
+      files:
+        from: file
+        path: files.json
+        as: json
+
+  - id: review
+    needs: [changed]
+    for_each: '{{ .steps.changed.outputs.files }}'
+    max_parallel: 6
+    isolate: true
+    workdir: ./repo
+    inputs:
+      target.txt: '{{ .item.path }}'
+    agent:
+      tools: [Read, Bash]
+      prompt: |
+        Review the file named in target.txt against origin/main.
+
+        Report only defects you can point at: a concrete input or state, and
+        the wrong behaviour that follows. Say "no findings" if there are none.
+        Do not report style preferences.
+
+  - id: synthesise
+    needs: [review]
+    isolate: true
+    inputs:
+      findings.json: '{{ .steps.review.items | json }}'
+    agent:
+      tools: [Read]
+      prompt: |
+        findings.json holds one reviewer's output per changed file.
+
+        Merge them into a single report: drop duplicates, drop anything that is
+        not a defect, and order what remains by how badly it would bite. Keep
+        the file and line references.

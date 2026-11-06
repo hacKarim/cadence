@@ -1,0 +1,93 @@
+# Screen deterministically, analyse in parallel, then let a sceptic that has
+# never seen the analyst's reasoning try to break each surviving case.
+#
+# This is the workflow shape cadence exists for. Steps 3 and 4 only mean
+# something because the sceptic's jail contains the report and nothing else.
+name: research-funnel
+description: Screen candidates, analyse them in parallel, challenge the survivors.
+
+schedule: "0 0 7 * * 1-5"
+timezone: Europe/Paris
+concurrency: skip
+catchup: false
+require_sandbox: true
+
+defaults:
+  timeout: 20m
+  retries: 1
+  backoff: { base: 5s, factor: 2, max: 2m }
+
+notify:
+  on: [failure]
+  slack: ${SLACK_WEBHOOK}
+
+steps:
+  # 1. No model involved. A script produces the candidate list.
+  - id: screen
+    workdir: ./tools
+    run: ./screen.py --limit 40 --out out/candidates.json
+    outputs:
+      candidates:
+        from: file
+        path: candidates.json
+        as: json
+
+  # 2. One analyst per candidate, four at a time. Each is given only the
+  #    figures for its own candidate.
+  - id: analyse
+    needs: [screen]
+    for_each: '{{ .steps.screen.outputs.candidates }}'
+    max_parallel: 4
+    cache: daily
+    isolate: true
+    inputs:
+      figures.json: '{{ .item | json }}'
+    agent:
+      tools: [Read, Write, WebSearch]
+      prompt: |
+        Read figures.json and analyse {{ .item.ticker }}.
+
+        Separate facts from assumptions. State plainly whether the share looks
+        under-valued, fairly priced, or cheap because profits are about to
+        fall. Give a bad case at least as bad as its worst three-month fall of
+        the past year.
+
+        Finish with a single JSON object on one line, then a line containing
+        =====REPORT===== and then the report itself.
+      extract: { after: "=====REPORT=====" }
+    outputs:
+      verdict:
+        from: stdout
+        as: raw
+        regex: '"verdict"\s*:\s*"([a-z-]+)"'
+
+  # 3. Only the survivors are challenged, and the sceptic is handed the report
+  #    and nothing else: no figures, no analyst reasoning, no sibling jail.
+  - id: challenge
+    needs: [analyse]
+    for_each: '{{ .steps.analyse.items }}'
+    when_item: '{{ eq .item.outputs.verdict "under-valued" }}'
+    max_parallel: 4
+    isolate: true
+    inputs:
+      report.md: '{{ .item.result }}'
+    agent:
+      tools: [Read]
+      prompt: |
+        You are the sceptic. Read report.md.
+
+        Your only job is to find out whether its case for a higher price is
+        wrong. Do not try to be balanced, and do not repeat its arguments.
+        Finish with one line: VERDICT=broken or VERDICT=stands.
+    outputs:
+      verdict:
+        from: stdout
+        as: raw
+        regex: 'VERDICT=(\w+)'
+
+  # 4. Publish only if anything survived both passes.
+  - id: publish
+    needs: [challenge]
+    if: '{{ gt (len .steps.challenge.items) 0 }}'
+    workdir: ./tools
+    run: ./publish.py --count {{ len .steps.challenge.items }}

@@ -1,0 +1,36 @@
+# Turn the commits since the last tag into a changelog entry.
+# A one-off workflow: no schedule, run it with `cadence run`.
+name: release-notes
+description: Summarise commits since the last tag into a changelog entry.
+
+defaults:
+  timeout: 5m
+
+steps:
+  - id: commits
+    workdir: ./repo
+    run: git log --pretty=format:'%h %s' "$(git describe --tags --abbrev=0)"..HEAD > out/commits.txt
+    outputs:
+      log:
+        from: file
+        path: commits.txt
+        as: raw
+
+  - id: draft
+    needs: [commits]
+    isolate: true
+    inputs:
+      commits.txt: '{{ .steps.commits.outputs.log }}'
+    agent:
+      tools: [Read, Write]
+      prompt: |
+        commits.txt holds the commits since the last release.
+
+        Write a changelog entry grouped into Added, Changed and Fixed. One line
+        per user-visible change, in plain language. Leave out refactors,
+        formatting and test-only commits. Write it to out/CHANGELOG-entry.md.
+    outputs:
+      entry:
+        from: file
+        path: CHANGELOG-entry.md
+        as: raw
