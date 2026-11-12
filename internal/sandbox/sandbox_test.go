@@ -2,12 +2,28 @@ package sandbox
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/hacKarim/cadence/internal/jail"
 )
+
+// policyPathInTmp creates a real directory inside /tmp and returns its path.
+// A policy path has to exist for bubblewrap to bind it, so a test that asserts
+// on one cannot name a path it did not create: an earlier version of this test
+// named a developer's own scratch directory and passed on that machine while
+// failing on a clean one.
+func policyPathInTmp(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "cadence-policy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
 
 func newJail(t *testing.T) *jail.Jail {
 	t.Helper()
@@ -146,8 +162,9 @@ func TestBubblewrapBindsWorkAndOutOnly(t *testing.T) {
 // so what a step can reach stays declared rather than accidental.
 func TestSeatbeltProfileAllowsPolicyPaths(t *testing.T) {
 	j := newJail(t)
-	p := seatbeltProfileWithPolicy(j, Policy{ReadWrite: []string{"/tmp/claude-501"}})
-	if !strings.Contains(p, `(subpath "`+resolve("/tmp/claude-501")+`")`) {
+	granted := policyPathInTmp(t)
+	p := seatbeltProfileWithPolicy(j, Policy{ReadWrite: []string{granted}})
+	if !strings.Contains(p, `(subpath "`+resolve(granted)+`")`) {
 		t.Errorf("profile does not grant the policy path:\n%s", p)
 	}
 }
@@ -199,7 +216,8 @@ func TestOverriddenReportsWhetherTheUserForcedIt(t *testing.T) {
 // directory, which is a channel between the two agents the design separates.
 func TestBubblewrapNeverBindsHostTmpOverItsOwnTmpfs(t *testing.T) {
 	j := newJail(t)
-	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{"/tmp", "/tmp/claude-501"}})
+	granted := policyPathInTmp(t)
+	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{"/tmp", granted}})
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "--bind /tmp /tmp") {
 		t.Errorf("host /tmp bound over the private tmpfs: %v", joined)
@@ -207,10 +225,10 @@ func TestBubblewrapNeverBindsHostTmpOverItsOwnTmpfs(t *testing.T) {
 	if !strings.Contains(joined, "--tmpfs /tmp") {
 		t.Error("no private tmpfs")
 	}
-	if !strings.Contains(joined, "--bind /tmp/claude-501 /tmp/claude-501") {
+	if !strings.Contains(joined, "--bind "+granted+" "+granted) {
 		t.Error("a specific path inside /tmp should still be grantable")
 	}
-	if i, k := strings.Index(joined, "--tmpfs /tmp"), strings.Index(joined, "--bind /tmp/claude-501"); i > k {
+	if i, k := strings.Index(joined, "--tmpfs /tmp"), strings.Index(joined, "--bind "+granted); i > k {
 		t.Error("the tmpfs must be mounted before anything is bound inside it")
 	}
 }
