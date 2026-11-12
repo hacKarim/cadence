@@ -55,8 +55,10 @@ func RenderGraph(tree *store.RunTree, width int, backend sandbox.Backend, enforc
 			line += fmt.Sprintf("  [%d/%d]", done, len(s.Items))
 		}
 		b.WriteString(clip(line, width) + "\n")
-		if s.Error != "" {
-			b.WriteString(clip(styleDim.Render("    "+s.Error), width) + "\n")
+		for _, note := range []string{s.Error, s.Note} {
+			if note != "" {
+				b.WriteString(clip(styleDim.Render("    "+note), width) + "\n")
+			}
 		}
 	}
 

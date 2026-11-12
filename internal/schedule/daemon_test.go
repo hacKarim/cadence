@@ -64,6 +64,17 @@ func wf(t *testing.T, body string) *spec.Workflow {
 
 const simpleWF = "name: nightly\nsteps:\n  - id: a\n    run: /bin/true\n"
 
+// launchAsync starts a launch and reports when it has finished, so a test
+// never returns while a goroutine is still writing into its temp directory.
+func launchAsync(l *Launcher, w *spec.Workflow) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.Launch(context.Background(), w, "h")
+	}()
+	return done
+}
+
 func TestConcurrencyAllowRunsBoth(t *testing.T) {
 	st := openStore(t)
 	ex := newFakeExec()
@@ -72,11 +83,13 @@ func TestConcurrencyAllowRunsBoth(t *testing.T) {
 	w := wf(t, simpleWF)
 	w.Concurrency = spec.ConcurrencyAllow
 
-	go l.Launch(context.Background(), w, "h")
+	first := launchAsync(l, w)
 	<-ex.started
-	go l.Launch(context.Background(), w, "h")
+	second := launchAsync(l, w)
 	<-ex.started
 	close(ex.hold)
+	<-first
+	<-second
 
 	if ex.count() != 2 {
 		t.Errorf("ran %d times, want 2 with concurrency: allow", ex.count())
@@ -91,7 +104,7 @@ func TestConcurrencySkipRecordsSkippedRun(t *testing.T) {
 	w := wf(t, simpleWF)
 	w.Concurrency = spec.ConcurrencySkip
 
-	go l.Launch(context.Background(), w, "h")
+	first := launchAsync(l, w)
 	<-ex.started
 
 	launched, err := l.Launch(context.Background(), w, "h")
@@ -102,6 +115,7 @@ func TestConcurrencySkipRecordsSkippedRun(t *testing.T) {
 		t.Error("second launch ran while the first still held the lock")
 	}
 	close(ex.hold)
+	<-first
 
 	runs, _ := st.ListRuns("nightly", 10)
 	var skipped int
@@ -126,7 +140,7 @@ func TestConcurrencyQueueRunsAfterLockFrees(t *testing.T) {
 	w := wf(t, simpleWF)
 	w.Concurrency = spec.ConcurrencyQueue
 
-	go l.Launch(context.Background(), w, "h")
+	first := launchAsync(l, w)
 	<-ex.started
 
 	done := make(chan bool, 1)
@@ -142,6 +156,7 @@ func TestConcurrencyQueueRunsAfterLockFrees(t *testing.T) {
 	}
 
 	close(ex.hold)
+	<-first
 	select {
 	case launched := <-done:
 		if !launched {
@@ -185,12 +200,14 @@ func TestDaemonTriggersOnScheduleOnlyOnce(t *testing.T) {
 	if err := d.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
+	d.Wait()
 	if ex.count() != 1 {
 		t.Fatalf("ran %d times on the first tick, want 1", ex.count())
 	}
 	if err := d.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	d.Wait()
 	if ex.count() != 1 {
 		t.Errorf("ran %d times after a second tick at the same instant, want 1", ex.count())
 	}
@@ -205,6 +222,7 @@ func TestDaemonIgnoresWorkflowsWithoutSchedule(t *testing.T) {
 	if err := d.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	d.Wait()
 	if ex.count() != 0 {
 		t.Errorf("ran an unscheduled workflow %d times", ex.count())
 	}
@@ -227,7 +245,82 @@ func TestDaemonReportsBadFileAndKeepsGoing(t *testing.T) {
 	if err == nil {
 		t.Error("Tick did not report the broken workflow file")
 	}
+	d.Wait()
 	if ex.count() != 1 {
 		t.Errorf("the good workflow ran %d times, want 1 despite the broken neighbour", ex.count())
 	}
+}
+
+// A workflow with a long agent step must not stop every other schedule from
+// even being evaluated.
+func TestOneSlowWorkflowDoesNotBlockTheOthers(t *testing.T) {
+	dir := t.TempDir()
+	slow := "name: slow\nschedule: \"0 0 7 * * *\"\nsteps:\n  - id: a\n    run: /bin/true\n"
+	quick := "name: quick\nschedule: \"0 0 7 * * *\"\nsteps:\n  - id: a\n    run: /bin/true\n"
+	os.WriteFile(filepath.Join(dir, "a-slow.yaml"), []byte(slow), 0o600)
+	os.WriteFile(filepath.Join(dir, "b-quick.yaml"), []byte(quick), 0o600)
+
+	st := openStore(t)
+	ex := newFakeExec()
+	ex.hold = make(chan struct{})
+	now := at("2026-03-05 07:00:01")
+	d := &Daemon{
+		Dir: dir, Store: st,
+		Launcher: &Launcher{Store: st, Exec: ex},
+		Now:      func() time.Time { return now },
+	}
+	d.Seed("slow", at("2026-03-04 07:00:00"))
+	d.Seed("quick", at("2026-03-04 07:00:00"))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ex.started:
+		case <-deadline:
+			close(ex.hold)
+			d.Wait()
+			t.Fatalf("only %d of 2 workflows started: a slow run blocked the scheduler", i)
+		}
+	}
+	close(ex.hold)
+	d.Wait()
+}
+
+// Tick must not stack a second launch of a workflow whose previous launch is
+// still going, or a slow workflow accumulates goroutines every interval.
+func TestTickDoesNotStackLaunchesOfTheSameWorkflow(t *testing.T) {
+	dir := t.TempDir()
+	body := "name: nightly\nschedule: \"* * * * * *\"\nconcurrency: allow\nsteps:\n  - id: a\n    run: /bin/true\n"
+	os.WriteFile(filepath.Join(dir, "n.yaml"), []byte(body), 0o600)
+
+	st := openStore(t)
+	ex := newFakeExec()
+	ex.hold = make(chan struct{})
+	base := at("2026-03-05 07:00:00")
+	n := 0
+	d := &Daemon{
+		Dir: dir, Store: st,
+		Launcher: &Launcher{Store: st, Exec: ex},
+		// One boundary per tick, so each tick is genuinely due rather than
+		// being a missed slot that catchup: false correctly drops.
+		Now: func() time.Time { n++; return base.Add(time.Duration(n) * time.Second) },
+	}
+	d.Seed("nightly", base)
+
+	for i := 0; i < 4; i++ {
+		if err := d.Tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-ex.started
+	time.Sleep(100 * time.Millisecond)
+	if got := ex.count(); got != 1 {
+		t.Errorf("launched %d times while one launch was still in flight, want 1", got)
+	}
+	close(ex.hold)
+	d.Wait()
 }

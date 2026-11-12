@@ -8,6 +8,7 @@ import (
 
 	"github.com/hacKarim/cadence/internal/runner"
 	"github.com/hacKarim/cadence/internal/store"
+	"github.com/hacKarim/cadence/internal/template"
 )
 
 const fanoutWF = `
@@ -330,6 +331,58 @@ steps:
 	for _, c := range f.CallsFor("challenge") {
 		if !strings.Contains(c.Prompt, "verdict") {
 			t.Errorf("challenge prompt %q should carry the analyst result", c.Prompt)
+		}
+	}
+}
+
+// Cancellation can land while the engine is still creating items. Recording
+// the step as succeeded there is the worst possible outcome: --resume then
+// inherits it and the work is silently never done.
+func TestFanOutCancelledBeforeItemsStartIsNotSuccess(t *testing.T) {
+	e, f, st := harness(t, nil)
+	wf := parse(t, fanoutWF)
+
+	run := &store.Run{
+		Workflow: wf.Name, WorkflowHash: "h", State: store.StateRunning,
+		Trigger: "manual", RunDir: t.TempDir(), StartedAt: time.Now(),
+	}
+	if err := st.CreateRun(run); err != nil {
+		t.Fatal(err)
+	}
+	rs := &runState{
+		run: run, views: map[string]template.StepView{},
+		done: map[string]bool{}, failed: map[string]bool{},
+		stepRows: map[string]*store.StepRun{},
+	}
+	rs.setView("screen", template.StepView{
+		Outputs: map[string]any{"items": []any{
+			map[string]any{"ticker": "A"}, map[string]any{"ticker": "B"},
+		}},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	step, _ := wf.Step("analyse")
+	state, err := e.runStep(ctx, wf, step, rs)
+	if err != nil {
+		t.Fatalf("runStep: %v", err)
+	}
+	if f.CallCount("analyse") != 0 {
+		t.Fatalf("items ran despite a cancelled context")
+	}
+	if state == store.StateSucceeded {
+		t.Errorf("state = succeeded with zero items executed; --resume would inherit this step and skip the work")
+	}
+	if state != store.StateCancelled {
+		t.Errorf("state = %q, want cancelled", state)
+	}
+	tree, _ := st.RunTree(run.ID)
+	for _, s := range tree.Steps {
+		for _, it := range s.Items {
+			if it.State == store.StateSkipped && strings.Contains(it.Error, "earlier item failed") {
+				t.Errorf("item %d blames a failure that never happened: %q", it.Index, it.Error)
+			}
 		}
 	}
 }

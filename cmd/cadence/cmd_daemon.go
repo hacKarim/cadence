@@ -31,6 +31,7 @@ func (x engineExecutor) Execute(ctx context.Context, wf *spec.Workflow, hash str
 		MaxParallel: 4,
 		RunRoot:     filepath.Join(dataDir(), "runs"),
 		Trigger:     "schedule",
+		Log:         x.out,
 	})
 	run, err := e.Run(ctx, wf, hash)
 	if err != nil {

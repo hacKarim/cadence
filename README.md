@@ -54,7 +54,9 @@ Three things follow from that:
   and nothing else, so there is no analyst reasoning to find.
 - **The environment is built, not inherited.** A child gets `PATH`, `HOME` and
   a short allowlist, plus whatever the step's `env:` names. A credential
-  sitting in your shell does not silently reach every step.
+  sitting in your shell does not silently reach every step, and the agent
+  CLI's own credentials reach agent steps only. `TMPDIR` points at a directory
+  inside the jail, so a step's scratch files are its own.
 - **The kernel enforces it.** On macOS through a generated `sandbox-exec`
   profile, on Linux through `bubblewrap` with a fresh mount namespace.
 
@@ -160,7 +162,7 @@ invocation).
 | `max_parallel` | items in flight for this step |
 | `inputs` | files staged into `work/` before the step starts |
 | `outputs` | values lifted out of what the step produced |
-| `env` | environment entries, expanded from `${VAR}` at load time |
+| `env` | environment entries; `${VAR}` expands from your shell at load time, and the value is a template like any other |
 | `allow` | paths outside the jail this step may read and write |
 | `cache` | `never` (default), `daily`, or `always` |
 | `isolate` | give the step a clean working directory |
@@ -225,6 +227,11 @@ steps, leaving the failed run on record exactly as it happened. If the workflow
 file changed since then it refuses, rather than quietly mixing results from two
 different definitions.
 
+Resume is step-granular. A fan-out step that was interrupted with 38 of 40
+items finished is re-run in full, because only whole successful steps are
+inherited. `cache: always` on that step makes the finished items free on the
+second attempt, which is the way to get item-level resume today.
+
 ### Scheduling
 
 `concurrency` decides what a trigger does while a previous run is still going:
@@ -262,6 +269,13 @@ have to ask.
   directories.** They have to be, or the process cannot start. This is a
   documented widening: an agent step with file tools can reach its own CLI
   state. It still cannot reach another step's jail.
+- **Agent steps share one directory with each other: the CLI's own per-user
+  temp path**, which it opens by name and which therefore has to be granted.
+  Their jails, scratch directories and outputs are all separate; that one path
+  is not. Shell steps are not granted it.
+- **`{{ .steps.<id>.result }}` is empty for a fan-out step**, which has many
+  results rather than one. Use `{{ .steps.<id>.items }}` and read `.item.result`
+  inside a `for_each`.
 - `cadence` is single-machine and single-user. No remote runners, no multi
   tenancy.
 

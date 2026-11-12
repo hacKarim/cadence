@@ -157,8 +157,12 @@ func (s *Store) PruneCache(olderThan time.Time) (int, error) {
 	return len(keys), nil
 }
 
-// copyTree copies a directory recursively, hardlinking where the filesystem
-// allows it and falling back to a byte copy.
+// copyTree copies a directory recursively.
+//
+// It copies bytes rather than hardlinking on purpose. A cache hit hands the
+// new run these files, and a step that rewrites its own output (which is all
+// `>` in a shell does) would otherwise rewrite the cache entry and the
+// artifact an earlier run is recorded as having produced.
 func copyTree(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
 		return nil
@@ -180,9 +184,6 @@ func copyTree(src, dst string) error {
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 			return err
-		}
-		if err := os.Link(p, target); err == nil {
-			return nil
 		}
 		in, err := os.Open(p)
 		if err != nil {

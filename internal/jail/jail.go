@@ -25,11 +25,13 @@ import (
 //
 //	<root>/work/      the process cwd, holding staged inputs
 //	<root>/work/out/  where the step writes results
+//	<root>/work/tmp/  the step's own TMPDIR
 //	<root>/meta/      engine-owned logs, outside the step's reach
 type Jail struct {
 	Root string
 	Work string
 	Out  string
+	Tmp  string
 	Meta string
 }
 
@@ -41,8 +43,10 @@ var inputNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
 // Anything else must be declared on the step.
 var envAllowlist = []string{"PATH", "HOME", "TERM", "LANG", "LC_ALL", "TZ", "SHELL", "TMPDIR"}
 
-// envPrefixAllowlist covers the variables the claude CLI needs to authenticate.
-var envPrefixAllowlist = []string{"ANTHROPIC_", "CLAUDE_"}
+// agentEnvPrefixes are the variables the claude CLI needs to authenticate.
+// They reach agent steps only: a shell step has no use for them, and every
+// step has a network.
+var agentEnvPrefixes = []string{"ANTHROPIC_", "CLAUDE_"}
 
 // Create builds the tree for one item of one step under a run directory.
 func Create(runDir, stepID string, itemIndex int) (*Jail, error) {
@@ -52,9 +56,10 @@ func Create(runDir, stepID string, itemIndex int) (*Jail, error) {
 		Root: root,
 		Work: work,
 		Out:  filepath.Join(work, "out"),
+		Tmp:  filepath.Join(work, "tmp"),
 		Meta: filepath.Join(root, "meta"),
 	}
-	for _, d := range []string{j.Work, j.Out, j.Meta} {
+	for _, d := range []string{j.Work, j.Out, j.Tmp, j.Meta} {
 		if err := os.MkdirAll(d, 0o750); err != nil {
 			return nil, fmt.Errorf("create jail: %w", err)
 		}
@@ -64,7 +69,9 @@ func Create(runDir, stepID string, itemIndex int) (*Jail, error) {
 
 // Stage materialises the step's workdir and declared inputs inside work/.
 func (j *Jail) Stage(st spec.Step, sc template.Scope) error {
-	if st.Workdir != "" {
+	// isolate: true means the step starts from a clean working directory, so
+	// a workflow-wide default workdir is not staged into it.
+	if st.Workdir != "" && !st.Isolate {
 		if err := copyTreeReadOnly(st.Workdir, j.Work); err != nil {
 			return fmt.Errorf("stage workdir %q: %w", st.Workdir, err)
 		}
@@ -102,23 +109,33 @@ func (j *Jail) Stage(st spec.Step, sc template.Scope) error {
 // Env builds the child process environment. It is constructed from an
 // allowlist rather than inherited, so a secret in the parent environment does
 // not silently reach every step.
-func (j *Jail) Env(st spec.Step, parent []string) ([]string, error) {
+func (j *Jail) Env(st spec.Step, sc template.Scope, parent []string) ([]string, error) {
 	keep := map[string]string{}
 	for _, kv := range parent {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok {
 			continue
 		}
-		if allowedEnvKey(k) {
+		if allowedEnvKey(k, st.IsAgent()) {
 			keep[k] = v
 		}
 	}
+	// Declared values are templates, because the validator checks them as
+	// templates and applies the needs rule to them.
 	for k, v := range st.Env {
-		keep[k] = v
+		rendered, err := template.Render(v, sc)
+		if err != nil {
+			return nil, fmt.Errorf("env %q: %w", k, err)
+		}
+		keep[k] = rendered
 	}
 	// The step is told where to put results, so a workflow can use an absolute
 	// path as well as the relative out/ beside its working directory.
 	keep["CADENCE_OUT"] = j.Out
+	// Its temporary directory is its own. Handing it the host's and then
+	// denying access, which is what an enforcing sandbox does, breaks mktemp,
+	// git, pip and anything using the standard library's temp helpers.
+	keep["TMPDIR"] = j.Tmp
 	out := make([]string, 0, len(keep))
 	for k, v := range keep {
 		out = append(out, k+"="+v)
@@ -126,18 +143,50 @@ func (j *Jail) Env(st spec.Step, parent []string) ([]string, error) {
 	return out, nil
 }
 
-func allowedEnvKey(k string) bool {
+// RenderedEnv returns the step's declared environment after templating, for
+// the cache key. A value derived from the current item has to change the key;
+// a static secret must not, or rotating it would invalidate every entry.
+func (j *Jail) RenderedEnv(st spec.Step, sc template.Scope) (map[string]string, error) {
+	out := map[string]string{}
+	for k, v := range st.Env {
+		if !strings.Contains(v, "{{") {
+			continue
+		}
+		rendered, err := template.Render(v, sc)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = rendered
+	}
+	return out, nil
+}
+
+func allowedEnvKey(k string, isAgent bool) bool {
 	for _, a := range envAllowlist {
 		if k == a {
 			return true
 		}
 	}
-	for _, p := range envPrefixAllowlist {
+	if !isAgent {
+		return false
+	}
+	for _, p := range agentEnvPrefixes {
 		if strings.HasPrefix(k, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// MetaDirFor returns the engine-owned metadata directory for an item, given
+// the output directory recorded in the store. The layout is defined here, so
+// a reader of a finished run does not have to re-derive it.
+func MetaDirFor(outDir string) string {
+	if outDir == "" {
+		return ""
+	}
+	// <root>/work/out -> <root>/meta
+	return filepath.Join(filepath.Dir(filepath.Dir(outDir)), "meta")
 }
 
 // Cleanup removes the jail. The engine keeps jails of finished runs, so this

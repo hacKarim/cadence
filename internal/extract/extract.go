@@ -120,6 +120,19 @@ func safeJoin(dir, rel string) (string, error) {
 	if !strings.HasPrefix(filepath.Clean(joined)+string(filepath.Separator), cleanDir) {
 		return "", fmt.Errorf("output path %q escapes the step directory", rel)
 	}
+	// The engine reads this file itself, outside the sandbox, so a symlink
+	// the step dropped must not be followed out of the directory.
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	realPath, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", fmt.Errorf("output file %q: %w", rel, err)
+	}
+	if !strings.HasPrefix(realPath+string(filepath.Separator), filepath.Clean(realDir)+string(filepath.Separator)) {
+		return "", fmt.Errorf("output path %q resolves outside the step directory", rel)
+	}
 	return joined, nil
 }
 

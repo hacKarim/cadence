@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,7 @@ type Options struct {
 	RunRoot     string
 	Trigger     string
 	Clock       Clock
+	Log         io.Writer
 }
 
 // Engine executes workflows. Runners are injected by kind ("shell", "agent")
@@ -61,6 +63,14 @@ func New(st *store.Store, runners map[string]runner.Runner, sb sandbox.Sandbox, 
 
 // Backend reports which sandbox backend this engine will confine steps with.
 func (e *Engine) Backend() sandbox.Backend { return e.sb.Name() }
+
+// logf reports something that went wrong but does not change the run's own
+// outcome, such as a bookkeeping write for an already-terminal step.
+func (e *Engine) logf(format string, args ...any) {
+	if e.opt.Log != nil {
+		fmt.Fprintf(e.opt.Log, "cadence: "+format+"\n", args...)
+	}
+}
 
 // runState carries the mutable bookkeeping of one run. Ready steps execute
 // concurrently, so every field here is guarded.
@@ -222,9 +232,11 @@ func (e *Engine) markUnreached(wf *spec.Workflow, rs *runState, cancelled bool) 
 		}
 		row := &store.StepRun{RunID: rs.run.ID, StepID: id, State: state}
 		if state == store.StateSkipped {
-			row.Error = "skipped: an earlier step failed"
+			row.Note = "skipped: an earlier step failed"
 		}
-		_ = e.store.CreateStepRun(row)
+		if err := e.store.CreateStepRun(row); err != nil {
+			e.logf("could not record skipped step %q: %v", id, err)
+		}
 	}
 }
 
@@ -282,9 +294,12 @@ func (e *Engine) inheritable(wfHash string) (map[string][]store.StepItem, error)
 
 // inheritStep records a step whose results are carried over from the run being
 // resumed, without executing anything.
-func (e *Engine) inheritStep(rs *runState, st *spec.Step, items []store.StepItem) store.State {
-	row := e.newStepRow(rs, st.ID, store.StateCached)
-	row.Error = fmt.Sprintf("inherited from run %d", e.opt.ResumeFrom)
+func (e *Engine) inheritStep(rs *runState, st *spec.Step, items []store.StepItem) (store.State, error) {
+	row, err := e.newStepRow(rs, st.ID, store.StateCached)
+	if err != nil {
+		return store.StateFailed, err
+	}
+	row.Note = fmt.Sprintf("inherited from run %d", e.opt.ResumeFrom)
 	_ = e.store.UpdateStepRun(row)
 
 	copies := make([]*store.StepItem, 0, len(items))
@@ -300,26 +315,32 @@ func (e *Engine) inheritStep(rs *runState, st *spec.Step, items []store.StepItem
 		copies = append(copies, it)
 	}
 	rs.setView(st.ID, viewFor(copies))
-	return store.StateCached
+	return store.StateCached, nil
 }
 
 // runStep executes one step: it gates on `if`, expands `for_each`, and runs
 // every item in its own jail under the parallelism bounds.
 func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, rs *runState) (store.State, error) {
 	if items, ok := rs.inherited[st.ID]; ok {
-		return e.inheritStep(rs, st, items), nil
+		return e.inheritStep(rs, st, items)
 	}
 
 	sc := rs.scope()
 
 	if st.If != "" {
-		ok, err := evalBool(st.If, sc)
-		if err != nil {
-			row := e.newStepRow(rs, st.ID, store.StateRunning)
-			return e.finishStep(row, store.StateFailed, fmt.Sprintf("if: %v", err)), nil
+		ok, evalErr := evalBool(st.If, sc)
+		if evalErr != nil {
+			row, err := e.newStepRow(rs, st.ID, store.StateRunning)
+			if err != nil {
+				return store.StateFailed, err
+			}
+			return e.finishStep(row, store.StateFailed, fmt.Sprintf("if: %v", evalErr)), nil
 		}
 		if !ok {
-			row := e.newStepRow(rs, st.ID, store.StateSkipped)
+			row, err := e.newStepRow(rs, st.ID, store.StateSkipped)
+			if err != nil {
+				return store.StateFailed, err
+			}
 			row.Error = "skipped: the step's if condition was false"
 			_ = e.store.UpdateStepRun(row)
 			rs.setView(st.ID, template.StepView{})
@@ -327,7 +348,10 @@ func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, 
 		}
 	}
 
-	row := e.newStepRow(rs, st.ID, store.StateRunning)
+	row, err := e.newStepRow(rs, st.ID, store.StateRunning)
+	if err != nil {
+		return store.StateFailed, err
+	}
 
 	items, err := e.expand(st, sc)
 	if err != nil {
@@ -340,7 +364,14 @@ func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, 
 	perStep := make(chan struct{}, perStepBound(st, e.opt.MaxParallel))
 
 	for i, input := range items {
-		if stop.Load() || ctx.Err() != nil {
+		// Cancellation and fail-fast both stop the spawn loop, but they are
+		// not the same outcome. Recording a cancelled step as succeeded would
+		// let --resume inherit it and skip the work for good.
+		if ctx.Err() != nil {
+			results[i] = e.recordItem(rs, st, i, store.StateCancelled, "cancelled before it started")
+			continue
+		}
+		if stop.Load() {
 			results[i] = e.recordSkippedItem(rs, st, i, "not started: an earlier item failed")
 			continue
 		}
@@ -367,6 +398,10 @@ func (e *Engine) runStep(ctx context.Context, wf *spec.Workflow, st *spec.Step, 
 			e.sem <- struct{}{}
 			defer func() { <-e.sem }()
 
+			if ctx.Err() != nil {
+				results[i] = e.recordItem(rs, st, i, store.StateCancelled, "cancelled before it started")
+				return
+			}
 			if stop.Load() {
 				results[i] = e.recordSkippedItem(rs, st, i, "not started: an earlier item failed")
 				return
@@ -398,12 +433,17 @@ func perStepBound(st *spec.Step, global int) int {
 	return global
 }
 
-func (e *Engine) newStepRow(rs *runState, stepID string, state store.State) *store.StepRun {
+// newStepRow records a step. A failure here is fatal to the step: the store
+// is the run's only record, and a step whose row does not exist would report a
+// state nobody can see.
+func (e *Engine) newStepRow(rs *runState, stepID string, state store.State) (*store.StepRun, error) {
 	start := time.Now()
 	row := &store.StepRun{RunID: rs.run.ID, StepID: stepID, State: state, StartedAt: &start}
-	_ = e.store.CreateStepRun(row)
+	if err := e.store.CreateStepRun(row); err != nil {
+		return nil, fmt.Errorf("record step %q: %w", stepID, err)
+	}
 	rs.setStepRow(stepID, row)
-	return row
+	return row, nil
 }
 
 func (e *Engine) recordItem(rs *runState, st *spec.Step, index int, state store.State, msg string) *store.StepItem {
@@ -412,7 +452,11 @@ func (e *Engine) recordItem(rs *runState, st *spec.Step, index int, state store.
 		StepRunID: rs.stepRow(st.ID).ID, Index: index, State: state,
 		Error: msg, StartedAt: &now, EndedAt: &now,
 	}
-	_ = e.store.CreateItem(it)
+	if err := e.store.CreateItem(it); err != nil {
+		// The item is still returned so aggregation sees the outcome, but it
+		// is downgraded to a failure: nothing about it was recorded.
+		it.State, it.Error = store.StateFailed, fmt.Sprintf("could not record item %d: %v", index, err)
+	}
 	return it
 }
 
@@ -512,7 +556,7 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 	if err := j.Stage(*st, sc); err != nil {
 		return fail(err.Error())
 	}
-	env, err := j.Env(*st, os.Environ())
+	env, err := j.Env(*st, sc, os.Environ())
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -542,6 +586,14 @@ func (e *Engine) runItem(ctx context.Context, st *spec.Step, rs *runState, sc te
 	if err != nil {
 		return fail(fmt.Sprintf("hash staged inputs: %v", err))
 	}
+	// Environment values derived from the current item are part of what this
+	// item was given, so they belong in the key. Static values do not: they
+	// are where secrets live, and rotating one must not invalidate the cache.
+	renderedEnv, err := j.RenderedEnv(*st, sc)
+	if err != nil {
+		return fail(fmt.Sprintf("render env: %v", err))
+	}
+	digest = mixEnv(digest, renderedEnv)
 	item.CacheKey = store.CacheKey(*st, rendered, digest, rs.run.WorkflowHash, st.Cache, e.opt.Clock.Now())
 
 	if item.CacheKey != "" && !e.opt.Force {
@@ -682,6 +734,25 @@ func stagedDigest(dir string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// mixEnv folds templated environment values into the staged digest in a
+// stable order.
+func mixEnv(digest string, env map[string]string) string {
+	if len(env) == 0 {
+		return digest
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	fmt.Fprint(h, digest)
+	for _, k := range keys {
+		fmt.Fprintf(h, "\x00%s=%s", k, env[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 const excerptBytes = 4096

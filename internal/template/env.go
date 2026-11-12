@@ -159,8 +159,11 @@ func Render(tmpl string, sc Scope) (string, error) {
 // normally and parsed, which is how a literal JSON document in a workflow
 // file still works.
 func RenderJSON(tmpl string, sc Scope) (any, error) {
-	effective := tmpl
-	if wrapped, ok := wrapSingleAction(tmpl); ok {
+	// Padding from a YAML block scalar or an indented value must not change
+	// the meaning of an otherwise identical template.
+	trimmed := strings.TrimSpace(tmpl)
+	effective := trimmed
+	if wrapped, ok := wrapSingleAction(trimmed); ok {
 		effective = wrapped
 	}
 	s, err := Render(effective, sc)
@@ -170,6 +173,18 @@ func RenderJSON(tmpl string, sc Scope) (any, error) {
 	var v any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &v); err != nil {
 		return nil, fmt.Errorf("expected JSON, got %.80q: %w", s, err)
+	}
+	// A step that printed a JSON array on stdout has a result which is a
+	// string whose contents are that array. Decoding it once more is what
+	// the user meant, and the only alternative is an error blaming them for
+	// producing exactly the list they produced.
+	if str, ok := v.(string); ok {
+		var inner any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(str)), &inner); err == nil {
+			if _, isArray := inner.([]any); isArray {
+				return inner, nil
+			}
+		}
 	}
 	return v, nil
 }
@@ -190,11 +205,16 @@ func wrapSingleAction(tmpl string) (string, bool) {
 	if !ok || action.Pipe == nil || len(action.Pipe.Cmds) == 0 {
 		return "", false
 	}
+	// A pipeline that ends in a helper already produces text, and appending
+	// json to it would encode that text as a JSON string.
 	last := action.Pipe.Cmds[len(action.Pipe.Cmds)-1]
 	if len(last.Args) > 0 {
-		if id, ok := last.Args[0].(*parse.IdentifierNode); ok && id.Ident == "json" {
+		if _, isHelper := last.Args[0].(*parse.IdentifierNode); isHelper {
 			return "", false
 		}
+	}
+	if len(action.Pipe.Decl) > 0 {
+		return "", false
 	}
 	return "{{ " + action.Pipe.String() + " | json }}", true
 }

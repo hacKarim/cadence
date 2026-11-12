@@ -151,3 +151,35 @@ func TestPruneRemovesOldEntries(t *testing.T) {
 		t.Error("recent entry was pruned")
 	}
 }
+
+// A cache hit hands the new run the saved artifacts. If those are hardlinks,
+// the new step rewriting its own output silently rewrites the cache entry and
+// the artifact the earlier run is recorded as having produced.
+func TestRestoredArtifactsAreIndependentCopies(t *testing.T) {
+	s := openTemp(t)
+	first, _ := jail.Create(t.TempDir(), "analyse", 0)
+	report := filepath.Join(first.Out, "report.md")
+	if err := os.WriteFile(report, []byte("ORIGINAL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCache("k", "analyse", first, nil, "r"); err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := jail.Create(t.TempDir(), "analyse", 0)
+	e, _, _ := s.LookupCache("k")
+	if err := RestoreCache(e, second); err != nil {
+		t.Fatal(err)
+	}
+	// The step rewrites its own output, exactly as `>` in a shell does.
+	if err := os.WriteFile(filepath.Join(second.Out, "report.md"), []byte("TAMPERED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if b, _ := os.ReadFile(report); string(b) != "ORIGINAL" {
+		t.Errorf("the earlier run's artifact now reads %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(e.ArtifactDir, "report.md")); string(b) != "ORIGINAL" {
+		t.Errorf("the cache entry now reads %q", b)
+	}
+}

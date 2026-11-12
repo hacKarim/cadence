@@ -98,6 +98,35 @@ type Daemon struct {
 
 	mu        sync.Mutex
 	baselines map[string]time.Time
+	inflight  map[string]bool
+	wg        sync.WaitGroup
+}
+
+// Wait blocks until every launch this daemon started has finished. Production
+// does not need it; tests do, because Tick returns as soon as the launches are
+// under way.
+func (d *Daemon) Wait() { d.wg.Wait() }
+
+// claim marks a workflow as launching. It returns false when a previous
+// launch is still in flight, so a slow workflow does not accumulate one
+// goroutine per tick.
+func (d *Daemon) claim(name string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.inflight == nil {
+		d.inflight = map[string]bool{}
+	}
+	if d.inflight[name] {
+		return false
+	}
+	d.inflight[name] = true
+	return true
+}
+
+func (d *Daemon) release(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.inflight, name)
 }
 
 // Seed sets the instant a workflow is considered to have last run, used when
@@ -133,9 +162,13 @@ func (d *Daemon) logf(format string, args ...any) {
 	}
 }
 
-// Tick evaluates every workflow in the directory once. A file that does not
-// parse is reported but never stops the others: one bad edit should not
-// silence every other schedule.
+// Tick evaluates every workflow in the directory once and starts the ones
+// that are due. Evaluation is sequential and cheap; the runs themselves go to
+// their own goroutines, because a workflow with a twenty minute agent step
+// must not stop every other schedule from even being looked at.
+//
+// A file that does not parse is reported but never stops the others: one bad
+// edit should not silence every other schedule.
 func (d *Daemon) Tick(ctx context.Context) error {
 	paths, err := workflowFiles(d.Dir)
 	if err != nil {
@@ -188,10 +221,22 @@ func (d *Daemon) tickOne(ctx context.Context, path string) error {
 		return nil
 	}
 
+	if !d.claim(wf.Name) {
+		d.logf("cadence: %s is still running, not starting another", wf.Name)
+		return nil
+	}
 	sum := sha256.Sum256(b)
+	hash := hex.EncodeToString(sum[:])
 	d.logf("cadence: launching %s", wf.Name)
-	_, err = d.Launcher.Launch(ctx, wf, hex.EncodeToString(sum[:]))
-	return err
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		defer d.release(wf.Name)
+		if _, err := d.Launcher.Launch(ctx, wf, hash); err != nil {
+			d.logf("cadence: %s: %v", wf.Name, err)
+		}
+	}()
+	return nil
 }
 
 // lastRunAt returns when this workflow last started, so a restarted daemon

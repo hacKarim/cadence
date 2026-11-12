@@ -105,3 +105,27 @@ func TestShellOutputIsCappedAndStreamed(t *testing.T) {
 		t.Errorf("stdout.log is %d bytes, want the full ~20MB stream", st.Size())
 	}
 }
+
+// A step that leaves a background child keeps the stdout pipe open, so
+// cmd.Run blocks on the copier even after the deadline kills the direct
+// child. Without a wait delay the item never returns and the scheduler wedges.
+func TestShellTimeoutReturnsEvenWithABackgroundChild(t *testing.T) {
+	r := shellReq(t, "sleep 60 & echo started; sleep 60")
+	r.Timeout = 300 * time.Millisecond
+	done := make(chan *Result, 1)
+	go func() {
+		res, err := NewShell(sandbox.Confined{}).Run(context.Background(), r)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if !res.TimedOut {
+			t.Error("TimedOut = false, want true")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the timeout: a background child held the output pipe open")
+	}
+}

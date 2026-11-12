@@ -68,3 +68,31 @@ steps:
 `)
 	wantInvalid(t, wf, "a")
 }
+
+// A step must not be able to reach the whole scope without naming what it
+// reads. Each of these renders another step's result at run time, so the
+// validator has to refuse them.
+func TestValidateRejectsScopeEvasion(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"index":    `{{ (index .steps "a").result }}`,
+		"with":     `{{ with .steps }}{{ .a.result }}{{ end }}`,
+		"variable": `{{ $s := .steps }}{{ $s.a.result }}`,
+		"range":    `{{ range $k, $v := .steps }}{{ $v.result }}{{ end }}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			wf := mustParse(t, `
+name: w
+steps:
+  - id: a
+    run: /bin/true
+  - id: b
+    run: /bin/true
+  - id: c
+    needs: [b]
+    agent:
+      prompt: '`+prompt+`'
+`)
+			wantInvalid(t, wf, "c")
+		})
+	}
+}

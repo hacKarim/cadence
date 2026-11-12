@@ -1,6 +1,7 @@
 package template
 
 import (
+	"sort"
 	"text/template/parse"
 )
 
@@ -21,42 +22,75 @@ var parseFuncs = func() map[string]any {
 	return m
 }()
 
-// Refs reports which steps a template reads and whether it reads the current
-// for_each item. The workflow validator uses this to prove, before anything
-// runs, that a step can only see what its needs list grants it.
-func Refs(tmpl string) (steps []string, usesItem bool, err error) {
-	trees, err := parse.Parse("refs", tmpl, "{{", "}}", parseFuncs)
-	if err != nil {
-		return nil, false, err
-	}
-	seen := map[string]bool{}
-	for _, t := range trees {
-		if t.Root == nil {
-			continue
-		}
-		walk(t.Root, seen, &usesItem)
-	}
-	for id := range seen {
-		steps = append(steps, id)
-	}
-	return steps, usesItem, nil
+// RefSet is what a template reads.
+//
+// Opaque is the important field. A template can reach the whole scope without
+// naming anything, for example by ranging over .steps or pulling a key out of
+// it with index. Those references cannot be resolved to a step id, so they are
+// collected here and the validator refuses them. Without that, the needs check
+// would only catch the honest spellings.
+type RefSet struct {
+	Steps    []string
+	UsesItem bool
+	Opaque   []string
 }
 
-func noteField(idents []string, seen map[string]bool, usesItem *bool) {
+// Refs reports which steps a template reads, whether it reads the current
+// for_each item, and any reference it cannot pin to a named step.
+func Refs(tmpl string) (RefSet, error) {
+	var rs RefSet
+	trees, err := parse.Parse("refs", tmpl, "{{", "}}", parseFuncs)
+	if err != nil {
+		return rs, err
+	}
+	seen := map[string]bool{}
+	w := &walker{seen: seen, rs: &rs}
+	for _, t := range trees {
+		if t.Root != nil {
+			w.walk(t.Root)
+		}
+	}
+	for id := range seen {
+		rs.Steps = append(rs.Steps, id)
+	}
+	sort.Strings(rs.Steps)
+	sort.Strings(rs.Opaque)
+	return rs, nil
+}
+
+type walker struct {
+	seen map[string]bool
+	rs   *RefSet
+}
+
+func (w *walker) opaque(what string) {
+	for _, o := range w.rs.Opaque {
+		if o == what {
+			return
+		}
+	}
+	w.rs.Opaque = append(w.rs.Opaque, what)
+}
+
+func (w *walker) field(idents []string) {
 	if len(idents) == 0 {
 		return
 	}
 	switch idents[0] {
 	case "steps":
-		if len(idents) >= 2 {
-			seen[idents[1]] = true
+		if len(idents) == 1 {
+			// `.steps` on its own: ranged over, bound to a variable, or
+			// handed to index. Whatever follows is not statically visible.
+			w.opaque("the whole .steps map")
+			return
 		}
+		w.seen[idents[1]] = true
 	case "item":
-		*usesItem = true
+		w.rs.UsesItem = true
 	}
 }
 
-func walk(n parse.Node, seen map[string]bool, usesItem *bool) {
+func (w *walker) walk(n parse.Node) {
 	switch v := n.(type) {
 	case nil:
 		return
@@ -65,38 +99,54 @@ func walk(n parse.Node, seen map[string]bool, usesItem *bool) {
 			return
 		}
 		for _, c := range v.Nodes {
-			walk(c, seen, usesItem)
+			w.walk(c)
 		}
 	case *parse.ActionNode:
-		walk(v.Pipe, seen, usesItem)
+		w.walk(v.Pipe)
 	case *parse.PipeNode:
 		if v == nil {
 			return
 		}
 		for _, c := range v.Cmds {
-			walk(c, seen, usesItem)
+			w.walk(c)
 		}
 	case *parse.CommandNode:
-		for _, a := range v.Args {
-			walk(a, seen, usesItem)
-		}
+		w.command(v)
 	case *parse.FieldNode:
-		noteField(v.Ident, seen, usesItem)
+		w.field(v.Ident)
 	case *parse.ChainNode:
-		walk(v.Node, seen, usesItem)
+		// A chain off something that is not a plain field, such as
+		// (index .steps "x").result, cannot be resolved statically. The
+		// inner node is walked, which flags the bare .steps.
+		w.walk(v.Node)
 	case *parse.IfNode:
-		walkBranch(&v.BranchNode, seen, usesItem)
+		w.branch(&v.BranchNode)
 	case *parse.RangeNode:
-		walkBranch(&v.BranchNode, seen, usesItem)
+		w.branch(&v.BranchNode)
 	case *parse.WithNode:
-		walkBranch(&v.BranchNode, seen, usesItem)
+		w.branch(&v.BranchNode)
 	case *parse.TemplateNode:
-		walk(v.Pipe, seen, usesItem)
+		w.walk(v.Pipe)
 	}
 }
 
-func walkBranch(b *parse.BranchNode, seen map[string]bool, usesItem *bool) {
-	walk(b.Pipe, seen, usesItem)
-	walk(b.List, seen, usesItem)
-	walk(b.ElseList, seen, usesItem)
+// command inspects a call. index applied to the root scope reaches whatever
+// the caller names at run time, so it is opaque for the same reason.
+func (w *walker) command(c *parse.CommandNode) {
+	if len(c.Args) >= 2 {
+		if id, ok := c.Args[0].(*parse.IdentifierNode); ok && id.Ident == "index" {
+			if _, isDot := c.Args[1].(*parse.DotNode); isDot {
+				w.opaque("index over the whole scope")
+			}
+		}
+	}
+	for _, a := range c.Args {
+		w.walk(a)
+	}
+}
+
+func (w *walker) branch(b *parse.BranchNode) {
+	w.walk(b.Pipe)
+	w.walk(b.List)
+	w.walk(b.ElseList)
 }

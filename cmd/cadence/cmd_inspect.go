@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hacKarim/cadence/internal/jail"
 	"github.com/hacKarim/cadence/internal/store"
 )
 
@@ -74,19 +75,27 @@ func cmdLogs(args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		fmt.Fprintf(stdout, "\n== %s [%s]\n", s.StepID, s.State)
-		if s.Error != "" {
-			fmt.Fprintf(stdout, "   %s\n", s.Error)
+		for _, note := range []string{s.Error, s.Note} {
+			if note != "" {
+				fmt.Fprintf(stdout, "   %s\n", note)
+			}
 		}
 		for _, it := range s.Items {
 			fmt.Fprintf(stdout, "   item %d [%s]\n", it.Index, it.State)
 			if it.Error != "" {
 				fmt.Fprintf(stdout, "     %s\n", it.Error)
 			}
-			if it.JailDir != "" {
-				logPath := filepath.Join(filepath.Dir(it.JailDir), "meta", "stdout.log")
-				if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
-					fmt.Fprintf(stdout, "%s\n", indent(string(b), "     "))
+			body := it.Result
+			if body == "" {
+				body = it.Excerpt
+			}
+			if body == "" && it.JailDir != "" {
+				if b, err := os.ReadFile(filepath.Join(jail.MetaDirFor(it.JailDir), "stdout.log")); err == nil {
+					body = string(b)
 				}
+			}
+			if strings.TrimSpace(body) != "" {
+				fmt.Fprintf(stdout, "%s\n", indent(body, "     "))
 			}
 		}
 	}
@@ -105,8 +114,10 @@ func printRunTree(w io.Writer, st *store.Store, id int64) {
 			detail = fmt.Sprintf(" (%d items)", n)
 		}
 		fmt.Fprintf(w, "  %-20s %s%s\n", s.StepID, s.State, detail)
-		if s.Error != "" {
-			fmt.Fprintf(w, "    %s\n", s.Error)
+		for _, note := range []string{s.Error, s.Note} {
+			if note != "" {
+				fmt.Fprintf(w, "    %s\n", note)
+			}
 		}
 	}
 }

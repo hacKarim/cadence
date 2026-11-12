@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -36,7 +37,10 @@ func AgentSupportPaths() []string {
 			)
 		}
 	}
-	out = append(out, os.TempDir())
+	// The shared temp directory is deliberately not granted: each item has
+	// its own inside the jail, and granting the host's would reopen a channel
+	// between the very steps the design separates. The CLI's per-user
+	// directory is granted because it opens that exact path itself.
 	out = append(out, filepath.Join("/tmp", "claude-"+strconv.Itoa(os.Getuid())))
 	return out
 }
@@ -44,9 +48,25 @@ func AgentSupportPaths() []string {
 // policyFor builds the sandbox policy for a step: the paths its own spec
 // declares, plus the agent CLI's support paths when it is an agent step.
 func policyFor(st spec.Step, isAgent bool) sandbox.Policy {
+	return policyForBinary(st, "")
+}
+
+// policyForBinary is policyFor plus the directory the agent binary lives in.
+// An npm, nvm or ~/.local install sits outside every system path the sandbox
+// binds, so without this the agent cannot be executed at all.
+func policyForBinary(st spec.Step, bin string) sandbox.Policy {
+	isAgent := st.IsAgent()
 	var paths []string
 	if isAgent {
 		paths = append(paths, AgentSupportPaths()...)
+		if bin != "" {
+			if resolved, err := exec.LookPath(bin); err == nil {
+				bin = resolved
+			}
+			if abs, err := filepath.Abs(bin); err == nil {
+				paths = append(paths, filepath.Dir(abs))
+			}
+		}
 	}
 	for _, a := range st.Allow {
 		paths = append(paths, expandHome(a))
@@ -116,7 +136,7 @@ func (a agentRunner) Run(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := withTimeout(ctx, r.Timeout)
 	defer cancel()
 
-	cmd, err := a.sb.Wrap(ctx, r.Jail, a.argv(r), policyFor(r.Step, true))
+	cmd, err := a.sb.Wrap(ctx, r.Jail, a.argv(r), policyForBinary(r.Step, a.bin))
 	if err != nil {
 		return nil, err
 	}

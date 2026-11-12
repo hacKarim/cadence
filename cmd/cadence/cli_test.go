@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hacKarim/cadence/internal/store"
 )
 
 func writeWF(t *testing.T, body string) string {
@@ -185,5 +187,39 @@ func TestRunSendsNoNotificationWithoutANotifyBlock(t *testing.T) {
 	}
 	if strings.Contains(errs, "notify") {
 		t.Errorf("stderr mentions notify for a workflow that configures none: %q", errs)
+	}
+}
+
+// The README says the lock lives in the database so a manual run and the
+// daemon cannot start the same workflow twice.
+func TestRunRespectsConcurrencySkipAgainstARunningWorkflow(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("CADENCE_DATA", data)
+	wf := writeWF(t, "name: demo\nconcurrency: skip\nsteps:\n  - id: greet\n    run: echo hello\n")
+
+	st, err := store.Open(filepath.Join(data, "cadence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := st.AcquireWorkflowLock("demo", 999)
+	if err != nil || !ok {
+		t.Fatalf("could not take the lock: %v %v", ok, err)
+	}
+	st.Close()
+
+	var out bytes.Buffer
+	code := run([]string{"run", wf}, &out, &out)
+	if code == 0 {
+		t.Errorf("manual run proceeded while the workflow was locked: %s", out.String())
+	}
+	if !strings.Contains(strings.ToLower(out.String()), "skip") {
+		t.Errorf("output %q should say the run was skipped and why", out.String())
+	}
+}
+
+func TestRunProceedsWhenNothingHoldsTheLock(t *testing.T) {
+	code, out, _ := invoke(t, "run", writeWF(t, goodWF))
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
 	}
 }

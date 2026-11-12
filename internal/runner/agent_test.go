@@ -211,3 +211,33 @@ func TestAgentSurfacesEnvelopeErrorMessage(t *testing.T) {
 		t.Errorf("Stderr = %q, want the envelope's error message", res.Stderr)
 	}
 }
+
+// The agent gets its own jail temp directory now, so granting the shared host
+// one would only reopen a channel between steps.
+func TestAgentPolicyDoesNotGrantTheSharedTempDirectory(t *testing.T) {
+	p := policyFor(spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}}, true)
+	for _, path := range p.ReadWrite {
+		if path == os.TempDir() {
+			t.Errorf("agent policy grants the shared temp directory %q", path)
+		}
+	}
+}
+
+// claude is commonly installed under ~/.local/bin or an nvm prefix, which is
+// outside every system path the sandbox binds.
+func TestAgentPolicyGrantsTheBinaryDirectory(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "tools", "claude")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	p := policyForBinary(spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}}, bin)
+	var found bool
+	for _, path := range p.ReadWrite {
+		if path == filepath.Dir(bin) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("agent policy does not grant the binary's own directory: %v", p.ReadWrite)
+	}
+}

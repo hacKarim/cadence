@@ -85,12 +85,16 @@ func (w *Workflow) validateScopes(add func(step, field, msg string)) {
 		sort.Strings(names)
 
 		for _, field := range names {
-			refs, usesItem, err := template.Refs(fields[field])
+			rs, err := template.Refs(fields[field])
 			if err != nil {
 				add(s.ID, field, fmt.Sprintf("template does not parse: %v", err))
 				continue
 			}
-			sort.Strings(refs)
+			for _, o := range rs.Opaque {
+				add(s.ID, field, fmt.Sprintf(
+					"reads %s, so what it can see cannot be checked before the run; reference the steps you need by name, such as .steps.<id>.result", o))
+			}
+			refs, usesItem := rs.Steps, rs.UsesItem
 			for _, r := range refs {
 				if _, known := byID[r]; !known {
 					add(s.ID, field, fmt.Sprintf("references unknown step %q", r))

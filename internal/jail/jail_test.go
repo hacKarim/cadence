@@ -97,7 +97,7 @@ func TestStageCopiesWorkdirReadOnly(t *testing.T) {
 func TestEnvIsConstructedNotInherited(t *testing.T) {
 	j, _ := Create(t.TempDir(), "a", 0)
 	parent := []string{"PATH=/bin", "HOME=/home/x", "AWS_SECRET_ACCESS_KEY=hunter2", "RANDOM_THING=1"}
-	env, err := j.Env(spec.Step{ID: "a"}, parent)
+	env, err := j.Env(spec.Step{ID: "a"}, template.Scope{}, parent)
 	if err != nil {
 		t.Fatalf("Env: %v", err)
 	}
@@ -114,7 +114,8 @@ func TestEnvIsConstructedNotInherited(t *testing.T) {
 
 func TestEnvCarriesAgentCredentials(t *testing.T) {
 	j, _ := Create(t.TempDir(), "a", 0)
-	env, _ := j.Env(spec.Step{ID: "a"}, []string{"ANTHROPIC_API_KEY=k", "CLAUDE_CONFIG_DIR=/c"})
+	agent := spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}}
+	env, _ := j.Env(agent, template.Scope{}, []string{"ANTHROPIC_API_KEY=k", "CLAUDE_CONFIG_DIR=/c"})
 	joined := strings.Join(env, "\n")
 	if !strings.Contains(joined, "ANTHROPIC_API_KEY=k") || !strings.Contains(joined, "CLAUDE_CONFIG_DIR=/c") {
 		t.Errorf("agent credentials not carried: %v", env)
@@ -123,7 +124,7 @@ func TestEnvCarriesAgentCredentials(t *testing.T) {
 
 func TestEnvIncludesDeclaredStepEnv(t *testing.T) {
 	j, _ := Create(t.TempDir(), "a", 0)
-	env, _ := j.Env(spec.Step{ID: "a", Env: map[string]string{"TICKER": "AAPL"}}, []string{"PATH=/bin"})
+	env, _ := j.Env(spec.Step{ID: "a", Env: map[string]string{"TICKER": "AAPL"}}, template.Scope{}, []string{"PATH=/bin"})
 	if !strings.Contains(strings.Join(env, "\n"), "TICKER=AAPL") {
 		t.Errorf("declared env missing: %v", env)
 	}
@@ -135,7 +136,7 @@ func TestEnvExposesNothingOutsideThisJail(t *testing.T) {
 	runDir := t.TempDir()
 	j, _ := Create(runDir, "a", 0)
 	_, _ = Create(runDir, "neighbour", 0)
-	env, _ := j.Env(spec.Step{ID: "a"}, []string{"PATH=/bin", "HOME=/home/x"})
+	env, _ := j.Env(spec.Step{ID: "a"}, template.Scope{}, []string{"PATH=/bin", "HOME=/home/x"})
 
 	for _, kv := range env {
 		_, v, _ := strings.Cut(kv, "=")
@@ -215,7 +216,7 @@ func TestMetaIsNotReachableFromWork(t *testing.T) {
 
 func TestEnvExposesOutputDirectory(t *testing.T) {
 	j, _ := Create(t.TempDir(), "a", 0)
-	env, _ := j.Env(spec.Step{ID: "a"}, []string{"PATH=/bin"})
+	env, _ := j.Env(spec.Step{ID: "a"}, template.Scope{}, []string{"PATH=/bin"})
 	want := "CADENCE_OUT=" + j.Out
 	for _, kv := range env {
 		if kv == want {
@@ -223,4 +224,107 @@ func TestEnvExposesOutputDirectory(t *testing.T) {
 		}
 	}
 	t.Errorf("environment does not expose the output directory: %v", env)
+}
+
+// A step is told where its temporary directory is, so it has to be able to
+// use it. Pointing TMPDIR at the host's and then denying it is worse than not
+// setting it at all: mktemp, git, pip and python's tempfile all fail.
+func TestJailHasItsOwnTempDirectory(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	if j.Tmp == "" {
+		t.Fatal("jail has no temporary directory")
+	}
+	if st, err := os.Stat(j.Tmp); err != nil || !st.IsDir() {
+		t.Fatalf("temp directory not created: %v", err)
+	}
+	rel, _ := filepath.Rel(j.Root, j.Tmp)
+	if strings.HasPrefix(rel, "..") {
+		t.Errorf("temp directory %q is outside the jail", j.Tmp)
+	}
+	env, _ := j.Env(spec.Step{ID: "a"}, template.Scope{}, []string{"TMPDIR=/host/tmp"})
+	want := "TMPDIR=" + j.Tmp
+	for _, kv := range env {
+		if kv == want {
+			return
+		}
+	}
+	t.Errorf("TMPDIR does not point at the jail's own directory: %v", env)
+}
+
+// The validator checks env values as templates and applies the needs rule to
+// them. If the engine then ships the raw braces, the validator is lying.
+func TestEnvValuesAreRendered(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	st := spec.Step{ID: "a", ForEach: "x", Env: map[string]string{"TICKER": "{{ .item.t }}"}}
+	sc := template.Scope{Item: map[string]any{"t": "AAPL"}}
+	env, err := j.Env(st, sc, []string{"PATH=/bin"})
+	if err != nil {
+		t.Fatalf("Env: %v", err)
+	}
+	for _, kv := range env {
+		if kv == "TICKER=AAPL" {
+			return
+		}
+	}
+	t.Errorf("env value was not rendered: %v", env)
+}
+
+// The README says a credential in your shell does not silently reach every
+// step. These are the agent CLI's credentials; a shell step has no use for
+// them and a shell step has a network.
+func TestAgentCredentialsDoNotReachShellSteps(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	parent := []string{"PATH=/bin", "ANTHROPIC_API_KEY=sk-ant-SECRET", "CLAUDE_CODE_OAUTH_TOKEN=tok"}
+
+	shellEnv, _ := j.Env(spec.Step{ID: "a", Run: "echo"}, template.Scope{}, parent)
+	for _, kv := range shellEnv {
+		if strings.Contains(kv, "SECRET") || strings.HasPrefix(kv, "CLAUDE_CODE_OAUTH_TOKEN") {
+			t.Errorf("a shell step was handed %q", kv)
+		}
+	}
+	agentEnv, _ := j.Env(spec.Step{ID: "a", Agent: &spec.AgentSpec{Prompt: "p"}}, template.Scope{}, parent)
+	var found bool
+	for _, kv := range agentEnv {
+		if kv == "ANTHROPIC_API_KEY=sk-ant-SECRET" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("an agent step was not given the credentials it needs")
+	}
+}
+
+// isolate: is documented as giving the step a clean working directory.
+func TestIsolateSkipsTheStagedWorkdir(t *testing.T) {
+	proj := t.TempDir()
+	os.WriteFile(filepath.Join(proj, "tool.py"), []byte("x"), 0o644)
+
+	plain, _ := Create(t.TempDir(), "a", 0)
+	if err := plain.Stage(spec.Step{ID: "a", Workdir: proj}, template.Scope{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(plain.Work, "tool.py")); err != nil {
+		t.Fatalf("workdir was not staged for a plain step: %v", err)
+	}
+
+	isolated, _ := Create(t.TempDir(), "a", 0)
+	if err := isolated.Stage(spec.Step{ID: "a", Workdir: proj, Isolate: true}, template.Scope{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(isolated.Work, "tool.py")); err == nil {
+		t.Error("isolate: true still staged the project directory")
+	}
+}
+
+// The store records an item by its output directory, and the log viewer has
+// to find the engine's own meta directory from that. Keeping the arithmetic
+// here means a change to the layout cannot silently break the viewer.
+func TestMetaDirForFindsTheEngineLogs(t *testing.T) {
+	j, _ := Create(t.TempDir(), "a", 0)
+	if got := MetaDirFor(j.Out); got != j.Meta {
+		t.Errorf("MetaDirFor(%q) = %q, want %q", j.Out, got, j.Meta)
+	}
+	if MetaDirFor("") != "" {
+		t.Error("MetaDirFor on an empty path should stay empty")
+	}
 }

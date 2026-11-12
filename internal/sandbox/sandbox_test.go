@@ -163,8 +163,9 @@ func TestEmptyPolicyGrantsNothingExtra(t *testing.T) {
 
 func TestBubblewrapBindsPolicyPaths(t *testing.T) {
 	j := newJail(t)
-	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{"/tmp"}})
-	if !strings.Contains(strings.Join(args, " "), "--bind /tmp /tmp") {
+	grant := t.TempDir()
+	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{grant}})
+	if !strings.Contains(strings.Join(args, " "), "--bind "+grant+" "+grant) {
 		t.Errorf("policy path not bound: %v", args)
 	}
 }
@@ -190,5 +191,45 @@ func TestOverriddenReportsWhetherTheUserForcedIt(t *testing.T) {
 	t.Setenv("CADENCE_SANDBOX", "confined")
 	if !Overridden() {
 		t.Error("Overridden = false although CADENCE_SANDBOX is set")
+	}
+}
+
+// bubblewrap gives the step a private /tmp. Binding the host's /tmp after
+// that would mount straight over it and hand every agent step the shared
+// directory, which is a channel between the two agents the design separates.
+func TestBubblewrapNeverBindsHostTmpOverItsOwnTmpfs(t *testing.T) {
+	j := newJail(t)
+	args := bwrapArgsWithPolicy(j, []string{"/bin/true"}, Policy{ReadWrite: []string{"/tmp", "/tmp/claude-501"}})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--bind /tmp /tmp") {
+		t.Errorf("host /tmp bound over the private tmpfs: %v", joined)
+	}
+	if !strings.Contains(joined, "--tmpfs /tmp") {
+		t.Error("no private tmpfs")
+	}
+	if !strings.Contains(joined, "--bind /tmp/claude-501 /tmp/claude-501") {
+		t.Error("a specific path inside /tmp should still be grantable")
+	}
+	if i, k := strings.Index(joined, "--tmpfs /tmp"), strings.Index(joined, "--bind /tmp/claude-501"); i > k {
+		t.Error("the tmpfs must be mounted before anything is bound inside it")
+	}
+}
+
+// bubblewrap warns about this itself: without a new session a sandboxed
+// process can push characters into the controlling terminal.
+func TestBubblewrapStartsANewSession(t *testing.T) {
+	args := bwrapArgs(newJail(t), []string{"/bin/true"})
+	if !strings.Contains(strings.Join(args, " "), "--new-session") {
+		t.Error("bwrap is not given --new-session")
+	}
+}
+
+// On a systemd-resolved host /etc/resolv.conf is a symlink into /run. Without
+// it bound, nothing in the sandbox can resolve a name, and agent steps have
+// to reach the API.
+func TestBubblewrapCanResolveNames(t *testing.T) {
+	joined := strings.Join(bwrapArgs(newJail(t), []string{"/bin/true"}), " ")
+	if !strings.Contains(joined, "/run/systemd/resolve") && !strings.Contains(joined, "/etc/resolv.conf") {
+		t.Errorf("no DNS configuration is reachable inside the sandbox: %v", joined)
 	}
 }

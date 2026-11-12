@@ -41,8 +41,11 @@ type StepRun struct {
 	State     State
 	StartedAt *time.Time
 	EndedAt   *time.Time
-	Error     string
-	Items     []StepItem
+	// Error explains a failure. Note explains a non-failure, such as a step
+	// that was skipped or inherited, so the two are never confused in output.
+	Error string
+	Note  string
+	Items []StepItem
 }
 
 // StepItem is one fan-out item of a step. A step without for_each has exactly
@@ -191,8 +194,8 @@ func (s *Store) ListRuns(workflow string, limit int) ([]Run, error) {
 // CreateStepRun inserts a step row and fills in its id.
 func (s *Store) CreateStepRun(sr *StepRun) error {
 	res, err := s.db.Exec(
-		`INSERT INTO step_runs (run_id, step_id, state, started_at, ended_at, error) VALUES (?,?,?,?,?,?)`,
-		sr.RunID, sr.StepID, string(sr.State), sr.StartedAt, sr.EndedAt, sr.Error)
+		`INSERT INTO step_runs (run_id, step_id, state, started_at, ended_at, error, note) VALUES (?,?,?,?,?,?,?)`,
+		sr.RunID, sr.StepID, string(sr.State), sr.StartedAt, sr.EndedAt, sr.Error, sr.Note)
 	if err != nil {
 		return err
 	}
@@ -202,8 +205,8 @@ func (s *Store) CreateStepRun(sr *StepRun) error {
 
 // UpdateStepRun writes back a step's mutable fields.
 func (s *Store) UpdateStepRun(sr *StepRun) error {
-	_, err := s.db.Exec(`UPDATE step_runs SET state=?, started_at=?, ended_at=?, error=? WHERE id=?`,
-		string(sr.State), sr.StartedAt, sr.EndedAt, sr.Error, sr.ID)
+	_, err := s.db.Exec(`UPDATE step_runs SET state=?, started_at=?, ended_at=?, error=?, note=? WHERE id=?`,
+		string(sr.State), sr.StartedAt, sr.EndedAt, sr.Error, sr.Note, sr.ID)
 	return err
 }
 
@@ -257,7 +260,7 @@ func (s *Store) RunTree(id int64) (*RunTree, error) {
 		return nil, err
 	}
 	rows, err := s.db.Query(
-		`SELECT id, run_id, step_id, state, started_at, ended_at, error FROM step_runs WHERE run_id=? ORDER BY id`, id)
+		`SELECT id, run_id, step_id, state, started_at, ended_at, error, note FROM step_runs WHERE run_id=? ORDER BY id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +270,7 @@ func (s *Store) RunTree(id int64) (*RunTree, error) {
 	for rows.Next() {
 		var sr StepRun
 		var state string
-		if err := rows.Scan(&sr.ID, &sr.RunID, &sr.StepID, &state, &sr.StartedAt, &sr.EndedAt, &sr.Error); err != nil {
+		if err := rows.Scan(&sr.ID, &sr.RunID, &sr.StepID, &state, &sr.StartedAt, &sr.EndedAt, &sr.Error, &sr.Note); err != nil {
 			return nil, err
 		}
 		sr.State = State(state)

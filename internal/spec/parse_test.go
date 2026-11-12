@@ -252,3 +252,53 @@ steps:
 		t.Errorf("Allow = %v", got)
 	}
 }
+
+// The README documents ${VAR} expansion and both shipped examples rely on it
+// for their webhook URLs. Without it the webhook POSTs to the literal string.
+func TestParseExpandsEnvReferencesInNotifyAndEnv(t *testing.T) {
+	t.Setenv("CADENCE_TEST_HOOK", "https://hooks.example/abc")
+	t.Setenv("CADENCE_TEST_REGION", "eu-west-1")
+	wf, err := Parse([]byte(`
+name: w
+notify:
+  on: [failure]
+  slack: ${CADENCE_TEST_HOOK}
+steps:
+  - id: a
+    run: /bin/true
+    env:
+      REGION: ${CADENCE_TEST_REGION}
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wf.Notify.Slack != "https://hooks.example/abc" {
+		t.Errorf("notify.slack = %q, want the expanded value", wf.Notify.Slack)
+	}
+	if wf.Steps[0].Env["REGION"] != "eu-west-1" {
+		t.Errorf("env.REGION = %q, want the expanded value", wf.Steps[0].Env["REGION"])
+	}
+}
+
+// Shell commands are full of dollar signs. Expanding them would corrupt every
+// command substitution in every workflow.
+func TestParseDoesNotExpandInsideRunCommands(t *testing.T) {
+	t.Setenv("HOME", "/home/someone")
+	wf, err := Parse([]byte("name: w\nsteps:\n  - id: a\n    run: 'git log \"$(git describe)\"..HEAD ${HOME}'\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wf.Steps[0].Run != `git log "$(git describe)"..HEAD ${HOME}` {
+		t.Errorf("run was rewritten: %q", wf.Steps[0].Run)
+	}
+}
+
+func TestParseLeavesUnsetVariablesVisible(t *testing.T) {
+	wf, err := Parse([]byte("name: w\nnotify:\n  on: [failure]\n  slack: ${CADENCE_DEFINITELY_UNSET}\nsteps:\n  - id: a\n    run: /bin/true\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if wf.Notify.Slack != "" {
+		t.Errorf("slack = %q, want empty so an unset variable is not posted as a literal", wf.Notify.Slack)
+	}
+}

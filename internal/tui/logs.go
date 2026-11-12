@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/glamour"
+	"github.com/hacKarim/cadence/internal/jail"
 	"github.com/hacKarim/cadence/internal/store"
 )
 
@@ -16,7 +17,7 @@ func ReadItemLog(it store.StepItem) string {
 	if it.JailDir == "" {
 		return ""
 	}
-	p := filepath.Join(filepath.Dir(it.JailDir), "meta", "stdout.log")
+	p := filepath.Join(jail.MetaDirFor(it.JailDir), "stdout.log")
 	b, err := os.ReadFile(p)
 	if err != nil {
 		return ""

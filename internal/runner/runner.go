@@ -99,6 +99,12 @@ func capture(ctx context.Context, cmd *exec.Cmd, j *jail.Jail, timeout time.Dura
 	var outCap, errCap cappedWriter
 	cmd.Stdout = io.MultiWriter(outFile, &outCap)
 	cmd.Stderr = io.MultiWriter(errFile, &errCap)
+	// Assigning an io.Writer makes os/exec pipe the streams through a copier
+	// goroutine, and Wait blocks until that copier sees EOF. A step that
+	// leaves a background child keeps the write end open, so killing the
+	// direct child on deadline is not enough: without a wait delay the item
+	// never returns and the scheduler wedges behind it.
+	cmd.WaitDelay = 5 * time.Second
 	if stdin != "" {
 		cmd.Stdin = bytes.NewBufferString(stdin)
 	}

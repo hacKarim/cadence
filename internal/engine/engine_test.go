@@ -11,6 +11,7 @@ import (
 	"github.com/hacKarim/cadence/internal/sandbox"
 	"github.com/hacKarim/cadence/internal/spec"
 	"github.com/hacKarim/cadence/internal/store"
+	"github.com/hacKarim/cadence/internal/template"
 )
 
 func harness(t *testing.T, script map[string]runner.FakeResponse) (*Engine, *runner.Fake, *store.Store) {
@@ -217,4 +218,32 @@ func TestRunDirectoryIsCreatedPerItem(t *testing.T) {
 	if jd == "" || !strings.Contains(jd, run.RunDir) {
 		t.Errorf("item jail dir = %q, want one under %q", jd, run.RunDir)
 	}
+}
+
+// The store is the single source of truth. If a write fails and the engine
+// discards the error, the run reports a state whose steps were never recorded.
+func TestStepFailsWhenTheStoreCannotRecordIt(t *testing.T) {
+	e, f, st := harness(t, nil)
+	wf := parse(t, "name: w\nsteps:\n  - id: a\n    run: echo a\n")
+
+	run := &store.Run{
+		Workflow: wf.Name, WorkflowHash: "h", State: store.StateRunning,
+		Trigger: "manual", RunDir: t.TempDir(), StartedAt: time.Now(),
+	}
+	if err := st.CreateRun(run); err != nil {
+		t.Fatal(err)
+	}
+	rs := &runState{
+		run: run, views: map[string]template.StepView{},
+		done: map[string]bool{}, failed: map[string]bool{},
+		stepRows: map[string]*store.StepRun{},
+	}
+	st.Close() // every subsequent write now fails
+
+	step, _ := wf.Step("a")
+	state, err := e.runStep(context.Background(), wf, step, rs)
+	if err == nil && state == store.StateSucceeded {
+		t.Error("the step reported success although nothing about it could be recorded")
+	}
+	_ = f
 }

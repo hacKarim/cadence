@@ -32,3 +32,13 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # bubblewrap is the one backend that cannot be exercised on a Mac, so
+      # it is the one that most needs running here.
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Sandbox integration tests
+        run: |
+          bwrap --version
+          go test -tags integration ./internal/sandbox/ -v

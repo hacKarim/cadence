@@ -168,3 +168,35 @@ func TestOutputRegexOnStdout(t *testing.T) {
 		t.Errorf("got %#v, want 42", got)
 	}
 }
+
+// The engine reads declared output files itself, outside the sandbox. A step
+// can drop a symlink in its output directory; following it would let the step
+// have the engine read and record any file on the machine.
+func TestOutputFromFileRefusesASymlinkOutOfTheDirectory(t *testing.T) {
+	d := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(d, "link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	v, err := Output(spec.OutputSpec{From: spec.OutputFromFile, Path: "link.txt", As: spec.ParseRaw}, Sources{Dir: d})
+	if err == nil {
+		t.Fatalf("read through a symlink out of the step directory: %v", v)
+	}
+}
+
+func TestOutputFromFileAllowsASymlinkInsideTheDirectory(t *testing.T) {
+	d := t.TempDir()
+	if err := os.WriteFile(filepath.Join(d, "real.txt"), []byte("fine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(d, "real.txt"), filepath.Join(d, "alias.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	v, err := Output(spec.OutputSpec{From: spec.OutputFromFile, Path: "alias.txt", As: spec.ParseRaw}, Sources{Dir: d})
+	if err != nil || v != "fine" {
+		t.Errorf("got %v, %v; a link inside the directory is legitimate", v, err)
+	}
+}

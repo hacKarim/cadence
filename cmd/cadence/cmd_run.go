@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/hacKarim/cadence/internal/schedule"
+	"github.com/hacKarim/cadence/internal/spec"
+
 	"github.com/hacKarim/cadence/internal/engine"
 	"github.com/hacKarim/cadence/internal/runner"
 	"github.com/hacKarim/cadence/internal/sandbox"
@@ -64,15 +67,29 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		Force:       *force,
 		ResumeFrom:  *resume,
 		RunRoot:     filepath.Join(dataDir(), "runs"),
+		Log:         stderr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	fmt.Fprintf(stdout, "running %s (sandbox: %s)\n", wf.Name, e.Backend())
-	run, err := e.Run(ctx, wf, hash)
+
+	// A manual run obeys the same concurrency policy as the daemon. The lock
+	// is in the database, so the two cannot start the same workflow twice.
+	exec := &manualExecutor{engine: e, store: st, wf: wf, out: stdout}
+	launched, err := (&schedule.Launcher{Store: st, Exec: exec}).Launch(ctx, wf, hash)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	if !launched {
+		fmt.Fprintf(stdout, "skipped: another run of %q is still going (concurrency: %s)\n", wf.Name, wf.Concurrency)
+		return 1
+	}
+
+	run := exec.run
+	if run == nil {
 		return 1
 	}
 	_ = notifyRun(ctx, st, wf, run, stdout)
@@ -85,4 +102,23 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// manualExecutor runs the workflow once and keeps the resulting run so the
+// command can report it after the launcher returns.
+type manualExecutor struct {
+	engine *engine.Engine
+	store  *store.Store
+	wf     *spec.Workflow
+	out    io.Writer
+	run    *store.Run
+}
+
+func (m *manualExecutor) Execute(ctx context.Context, wf *spec.Workflow, hash string) error {
+	run, err := m.engine.Run(ctx, wf, hash)
+	if err != nil {
+		return err
+	}
+	m.run = run
+	return nil
 }

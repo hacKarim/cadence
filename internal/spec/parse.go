@@ -2,6 +2,8 @@ package spec
 
 import (
 	"fmt"
+	"os"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -15,7 +17,37 @@ func Parse(data []byte) (*Workflow, error) {
 		return nil, err
 	}
 	wf.applyDefaults()
+	wf.expandEnvRefs()
 	return &wf, nil
+}
+
+// envRefRe matches the ${NAME} form only. Bare $NAME is deliberately left
+// alone: shell commands are full of dollar signs, and expanding them would
+// corrupt every command substitution in every workflow.
+var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandVars resolves ${NAME} from the process environment. An unset variable
+// becomes empty rather than staying as a literal, so a missing webhook is a
+// missing webhook and not a POST to the string "${SLACK_WEBHOOK}".
+func expandVars(s string) string {
+	return envRefRe.ReplaceAllStringFunc(s, func(m string) string {
+		return os.Getenv(envRefRe.FindStringSubmatch(m)[1])
+	})
+}
+
+// expandEnvRefs applies ${NAME} expansion to the fields documented to support
+// it: notification destinations and step environment values. Commands,
+// prompts and inputs are templates, not shell, and are left untouched.
+func (w *Workflow) expandEnvRefs() {
+	if w.Notify != nil {
+		w.Notify.Slack = expandVars(w.Notify.Slack)
+		w.Notify.Discord = expandVars(w.Notify.Discord)
+	}
+	for i := range w.Steps {
+		for k, v := range w.Steps[i].Env {
+			w.Steps[i].Env[k] = expandVars(v)
+		}
+	}
 }
 
 func (w *Workflow) applyDefaults() {

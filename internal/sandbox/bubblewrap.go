@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // Bubblewrap confines a step with bwrap: a fresh mount namespace where the
@@ -25,6 +26,9 @@ func bwrapArgsWithPolicy(j *jailRef, argv []string, pol Policy) []string {
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
 		"--share-net",
 		"--die-with-parent",
+		// Without a new session a sandboxed process can push characters into
+		// the controlling terminal; bubblewrap warns about this itself.
+		"--new-session",
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
@@ -34,8 +38,20 @@ func bwrapArgsWithPolicy(j *jailRef, argv []string, pol Policy) []string {
 			args = append(args, "--ro-bind", p, p)
 		}
 	}
+	// On a systemd-resolved host /etc/resolv.conf is a symlink into /run, so
+	// binding /etc alone leaves the sandbox unable to resolve a name, and
+	// agent steps have to reach the API.
+	for _, p := range []string{"/run/systemd/resolve", "/etc/resolv.conf"} {
+		args = append(args, "--ro-bind-try", p, p)
+	}
 	args = append(args, "--bind", j.Work, j.Work, "--bind", j.Out, j.Out)
 	for _, p := range pol.ReadWrite {
+		// Binding /tmp itself would mount straight over the private tmpfs
+		// above and hand every step the shared host directory. A specific
+		// path inside it is still grantable, and lands inside the tmpfs.
+		if filepath.Clean(p) == "/tmp" {
+			continue
+		}
 		if _, err := os.Stat(p); err == nil {
 			args = append(args, "--bind", p, p)
 		}

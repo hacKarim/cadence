@@ -25,6 +25,7 @@ var migrations = []string{
 		started_at TIMESTAMP,
 		ended_at   TIMESTAMP,
 		error      TEXT      NOT NULL DEFAULT '',
+		note       TEXT      NOT NULL DEFAULT '',
 		UNIQUE(run_id, step_id)
 	);
 

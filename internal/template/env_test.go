@@ -158,3 +158,51 @@ func TestRenderJSONAcceptsLiteralDocument(t *testing.T) {
 		t.Errorf("got %#v, want a one-element array", v)
 	}
 }
+
+// A shell step that prints a JSON array and a downstream for_each over its
+// result is the most natural thing a user will write.
+func TestRenderJSONDecodesAStringThatContainsJSON(t *testing.T) {
+	sc := Scope{Steps: map[string]StepView{"a": {Result: `[{"t":"A"},{"t":"B"}]`}}}
+	v, err := RenderJSON("{{ .steps.a.result }}", sc)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("got %T (%v), want []any", v, v)
+	}
+	if len(arr) != 2 {
+		t.Errorf("len = %d, want 2", len(arr))
+	}
+}
+
+// A YAML block scalar adds a trailing newline and indented YAML adds leading
+// space. Identical templates must not behave differently because of padding.
+func TestRenderJSONIgnoresSurroundingWhitespace(t *testing.T) {
+	sc := scopeFixture()
+	for _, tmpl := range []string{
+		" {{ .steps.screen.outputs.candidates }}",
+		"{{ .steps.screen.outputs.candidates }}\n",
+		"\n  {{ .steps.screen.outputs.candidates }}  \n",
+	} {
+		v, err := RenderJSON(tmpl, sc)
+		if err != nil {
+			t.Errorf("RenderJSON(%q): %v", tmpl, err)
+			continue
+		}
+		if _, ok := v.([]any); !ok {
+			t.Errorf("RenderJSON(%q) = %T, want []any", tmpl, v)
+		}
+	}
+}
+
+func TestRenderJSONDoesNotWrapAPipelineEndingInAnotherHelper(t *testing.T) {
+	sc := Scope{Steps: map[string]StepView{"a": {Result: "  [1,2]  "}}}
+	v, err := RenderJSON("{{ .steps.a.result | trim }}", sc)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	if arr, ok := v.([]any); !ok || len(arr) != 2 {
+		t.Errorf("got %#v, want a two-element array", v)
+	}
+}
