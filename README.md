@@ -94,6 +94,89 @@ on your `PATH` for agent steps.
 
 ## A workflow
 
+This is [`examples/research-funnel.yaml`](examples/research-funnel.yaml), the
+shape described above: screen deterministically, analyse in parallel, then let
+a sceptic attack each surviving case without showing it how that case was
+built.
+
+```mermaid
+flowchart TB
+    cron(["cron 0 0 7 * * 1-5 · Europe/Paris · concurrency: skip"]) --> screen
+
+    screen["screen · shell · own jail<br/>./screen.py --limit 40<br/>writes out/candidates.json"]
+
+    screen -- "candidates: 40 items, parsed as json" --> fan
+
+    fan[["for_each · max_parallel: 4 · cache: daily"]]
+
+    subgraph s2 ["analyse · one jail each"]
+        direction LR
+        a1["analyst 1<br/>sees figures.json"]
+        a2["analyst 2<br/>sees figures.json"]
+        ax["..."]
+        a40["analyst 40<br/>sees figures.json"]
+    end
+
+    fan --> a1
+    fan --> a2
+    fan --> ax
+    fan --> a40
+
+    a1 --> gate
+    a2 --> gate
+    ax --> gate
+    a40 --> gate
+
+    gate{"when_item<br/>verdict == under-valued"}
+
+    gate -- "34 do not match" --> dropped(["never run"])
+    gate -- "6 survive" --> fan2
+
+    fan2[["for_each · max_parallel: 4"]]
+
+    subgraph s3 ["challenge · one jail each"]
+        direction LR
+        c1["sceptic 1<br/>jail holds report.md<br/>and nothing else"]
+        cx["..."]
+        c6["sceptic 6<br/>jail holds report.md<br/>and nothing else"]
+    end
+
+    fan2 --> c1
+    fan2 --> cx
+    fan2 --> c6
+
+    c1 --> cond
+    cx --> cond
+    c6 --> cond
+
+    cond{"if len(challenge.items) > 0"}
+    cond -- "no" --> nothing(["run ends, nothing published"])
+    cond -- "yes" --> publish
+
+    publish["publish · shell · own jail<br/>./publish.py --count 6"]
+
+    a1 -- "reasoning and figures: unreachable" --x c1
+
+    linkStyle 20 stroke-width:2px,stroke-dasharray:5 5
+
+    classDef shell fill:#1f6feb,stroke:#1f6feb,color:#ffffff
+    classDef agent fill:#8250df,stroke:#8250df,color:#ffffff
+    classDef ctrl fill:#57606a,stroke:#57606a,color:#ffffff
+    classDef dead fill:#afb8c1,stroke:#afb8c1,color:#24292f
+    class screen,publish shell
+    class a1,a2,ax,a40,c1,cx,c6 agent
+    class fan,fan2,gate,cond,cron ctrl
+    class dropped,nothing dead
+```
+
+The crossed link is the point of the project. `analyst 1` produced the report
+that `sceptic 1` is attacking, but the sceptic's jail was built from
+`inputs: report.md` alone, so the analyst's reasoning, its `figures.json` and
+every sibling jail are unreachable: not by convention, but because
+`sandbox-exec` or `bubblewrap` denies the read.
+
+The YAML behind it, lightly abridged:
+
 ```yaml
 name: research-funnel
 schedule: "0 0 7 * * 1-5"      # six fields: second minute hour day month weekday
@@ -143,6 +226,13 @@ steps:
       prompt: |
         You are the sceptic. Read report.md. Your only job is to find out
         whether its case is wrong. Do not try to be balanced.
+    outputs:
+      verdict: { from: stdout, as: raw, regex: 'VERDICT=(\w+)' }
+
+  - id: publish
+    needs: [challenge]
+    if: '{{ gt (len .steps.challenge.items) 0 }}'
+    run: ./publish.py --count {{ len .steps.challenge.items }}
 ```
 
 More in [`examples/`](examples/). They are covered by the test suite, so they
@@ -278,6 +368,75 @@ have to ask.
   inside a `for_each`.
 - `cadence` is single-machine and single-user. No remote runners, no multi
   tenancy.
+
+## Status and roadmap
+
+Shipped, with tests:
+
+- [x] DAG scheduling: `needs`, topological ready set, bounded parallelism
+- [x] Fan-out with `for_each`, `max_parallel`, `when_item`, `on_item_failure`
+- [x] Conditional steps with `if`
+- [x] OS-enforced isolation: `sandbox-exec` on macOS, `bubblewrap` on Linux,
+      a reported `confined` fallback, and `require_sandbox` to refuse the fallback
+- [x] Declared `inputs` staged into the jail, and an environment that is built
+      rather than inherited
+- [x] Declared `outputs` from a file, stdout or the agent result, as json or
+      raw, with regex capture and JSONPath selection
+- [x] Static reference checking: a template that reads a step outside its
+      `needs` closure fails validation before anything runs
+- [x] Content-addressed step cache, `never` / `daily` / `always`
+- [x] `--resume`, inheriting successful steps as a new run
+- [x] Cron with timezone, `concurrency: skip`, `catchup`, and a daemon whose
+      lock lives in the database, so a manual run cannot race it
+- [x] Per-item `timeout`, `retries` and exponential `backoff`
+- [x] Slack or Discord webhook notification on run events
+- [x] Interactive interface, plus `validate`, `doctor`, `runs`, `logs`,
+      `cache prune`
+- [x] Shipped examples parsed and validated by the test suite, so they cannot
+      drift from the engine
+
+Next, roughly in the order I would build them:
+
+- [ ] **Budgets.** `budget: { usd: 5, minutes: 30 }` for a whole run. The agent
+      envelope already carries `total_cost_usd` per call, so the engine can
+      stop launching fan-out items once a run has spent its allowance, and say
+      what it skipped.
+- [ ] **Item-level resume.** Today `--resume` is step-granular, so an
+      interrupted 40-item fan-out pays for all 40 again unless it was cached.
+      Inheriting finished items individually is the fix.
+- [ ] **Pause for input.** A step that parks the run and waits on a person:
+      `cadence inbox` to see what is blocked, `cadence inbox reply <run> <step>`
+      to unblock it. Approval gates are the obvious use, and a scheduled
+      workflow that needs a decision currently has to fail instead.
+- [ ] **Run reports.** `cadence report <run-id> -o report.md`: the graph, each
+      step's duration and cost, the outputs, and the failures, as one file fit
+      to paste into a pull request or an issue.
+- [ ] **Pinned verifiers.** Mark a step as the judge, and hash-pin its spec and
+      its inputs at load time, so nothing upstream can rewrite the thing that
+      scores it. The jail already stops a step reading the verifier; this stops
+      it rewriting one.
+- [ ] **Best-of-N.** `strategy: { best_of: 5, score: <step> }`: run N variants
+      of a step in N jails and keep whichever a scorer ranks highest. The
+      fan-out machinery already does the hard part.
+- [ ] **Memory that outlives the run.** A small append-only store, kept in git,
+      that a workflow reads at the start and writes at the end, each entry
+      carrying the run that produced it. A daily workflow should be able to
+      stop repeating yesterday's mistake.
+- [ ] **A second agent backend.** `agent: { backend: codex }`. The runner
+      interface is already an interface; what is missing is a second envelope
+      parser and a second set of sandbox support paths.
+- [ ] **A container backend.** A third sandbox beside seatbelt and bubblewrap,
+      for disposable containers and for hosts where neither is available.
+- [ ] **`cadence-mcp`.** An MCP server over run history, step outputs and logs,
+      so the agent you are already talking to can ask what the scheduler did
+      overnight.
+- [ ] **`doctor --probe`.** One real agent call per configured backend, so
+      `doctor` proves the credentials work instead of proving the binary exists.
+
+Several of those are adapted from [kapso](https://github.com/Leeroo-AI/kapso),
+which solves a different problem (searching a tree of ML experiments) but has
+good answers for budgets, pausing on human input, and keeping what a run
+learned.
 
 ## Development
 
