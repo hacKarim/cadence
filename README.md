@@ -101,13 +101,13 @@ built.
 
 ```mermaid
 flowchart TB
-    cron(["cron 0 0 7 * * 1-5 · Europe/Paris · concurrency: skip"]) --> screen
+    cron(["cron: weekdays at 07:00<br/>Europe/Paris · concurrency: skip"]) --> screen
 
     screen["screen · shell · own jail<br/>./screen.py --limit 40<br/>writes out/candidates.json"]
 
     screen -- "candidates: 40 items, parsed as json" --> fan
 
-    fan[["for_each · max_parallel: 4 · cache: daily"]]
+    fan[["for_each<br/>max_parallel: 4 · cache: daily"]]
 
     subgraph s2 ["analyse · one jail each"]
         direction LR
@@ -132,13 +132,13 @@ flowchart TB
     gate -- "34 do not match" --> dropped(["never run"])
     gate -- "6 survive" --> fan2
 
-    fan2[["for_each · max_parallel: 4"]]
+    fan2[["for_each<br/>max_parallel: 4"]]
 
     subgraph s3 ["challenge · one jail each"]
         direction LR
-        c1["sceptic 1<br/>jail holds report.md<br/>and nothing else"]
+        c1["sceptic 1<br/>jail holds report.md only"]
         cx["..."]
-        c6["sceptic 6<br/>jail holds report.md<br/>and nothing else"]
+        c6["sceptic 6<br/>jail holds report.md only"]
     end
 
     fan2 --> c1
