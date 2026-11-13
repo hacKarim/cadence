@@ -1,0 +1,26 @@
+name: Feature request
+description: Something the engine should be able to express
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The workflow you cannot write today
+      description: Describe the job, not the key you want added.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do instead right now
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Before you file
+      options:
+        - label: I read the roadmap in the README and this is not already on it.
+          required: true
+        - label: I understand new keys in the spec language are rarely accepted.
+          required: true
